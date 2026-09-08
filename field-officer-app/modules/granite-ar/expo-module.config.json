@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["GraniteARModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.granitear.GraniteARModule"]
+  }
+}
