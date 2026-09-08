@@ -1,0 +1,18 @@
+# Django configurations
+db.sqlite3
+/backend/db.sqlite3
+
+# Environment files
+.env
+/backend/.env
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ML model files & outputs
+*.pt
+annotated_synthetic_output.png
+synthetic_block.png

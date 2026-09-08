@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="avatarGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b" />
+      <stop offset="100%" stop-color="#d97706" />
+    </linearGradient>
+    <clipPath id="circleClip">
+      <circle cx="50" cy="50" r="48" />
+    </clipPath>
+  </defs>
+  <!-- Outer border -->
+  <circle cx="50" cy="50" r="49" fill="none" stroke="#f59e0b" stroke-width="2" />
+  <g clip-path="url(#circleClip)">
+    <!-- Background -->
+    <rect width="100" height="100" fill="url(#avatarGrad)" />
+    <!-- Stylized portrait outline of N. Chandrababu Naidu (Specs, Beard, Hair styling) -->
+    <!-- Head/Face base -->
+    <path d="M50 25 C38 25, 38 45, 38 52 C38 60, 42 68, 50 68 C58 68, 62 60, 62 52 C62 45, 62 25, 50 25 Z" fill="#ffedd5" />
+    <!-- Hair -->
+    <path d="M37 40 C35 32, 38 20, 50 20 C62 20, 65 32, 63 40 C61 32, 59 23, 50 23 C41 23, 39 32, 37 40 Z" fill="#4b5563" />
+    <!-- Beard & Moustache (Signature look) -->
+    <path d="M38 52 C38 65, 42 74, 50 74 C58 74, 62 65, 62 52 C62 55, 60 62, 50 62 C40 62, 38 55, 38 52 Z" fill="#e5e7eb" />
+    <path d="M42 58 C45 60, 55 60, 58 58 C55 62, 45 62, 42 58 Z" fill="#9ca3af" />
+    <!-- Spectacles (Glasses - Signature look) -->
+    <rect x="41" y="42" width="8" height="6" rx="1" fill="none" stroke="#1f2937" stroke-width="1.5" />
+    <rect x="51" y="42" width="8" height="6" rx="1" fill="none" stroke="#1f2937" stroke-width="1.5" />
+    <line x1="49" y1="45" x2="51" y2="45" stroke="#1f2937" stroke-width="1.5" />
+    <line x1="39" y1="45" x2="41" y2="45" stroke="#1f2937" stroke-width="1.5" />
+    <line x1="59" y1="45" x2="61" y2="45" stroke="#1f2937" stroke-width="1.5" />
+    <!-- Clothes/Nehru Jacket -->
+    <path d="M25 85 L75 85 L70 70 L58 68 L50 74 L42 68 L30 70 Z" fill="#1e3a8a" />
+    <!-- Kurta collar -->
+    <path d="M42 68 L50 74 L58 68 L50 65 Z" fill="#f8fafc" />
+    <line x1="50" y1="74" x2="50" y2="85" stroke="#f59e0b" stroke-width="1.5" />
+  </g>
+</svg>

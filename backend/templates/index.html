@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Andhra Pradesh - Granite Block Inspection Portal</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --primary: #1e3a8a;
+            --primary-light: #3b82f6;
+            --primary-dark: #172554;
+            --accent: #d97706;
+            --bg-slate: #f8fafc;
+            --card-border: #e2e8f0;
+            --text-slate: #334155;
+            --text-heading: #0f172a;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --font-family: 'Plus Jakarta Sans', 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-family);
+            background-color: var(--bg-slate);
+            color: var(--text-slate);
+            line-height: 1.5;
+        }
+
+        /* Portal Header Styling */
+        header {
+            background: linear-gradient(135deg, var(--primary-dark), var(--primary));
+            color: white;
+            padding: 1.5rem 2rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .gov-seal-placeholder {
+            width: 48px;
+            height: 48px;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 0.8rem;
+            border: 2px solid var(--accent);
+            color: var(--accent);
+        }
+
+        .header-title h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+        }
+
+        .header-title p {
+            font-size: 0.85rem;
+            color: #93c5fd;
+            text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+        }
+
+        /* Tabs Navigation */
+        .tabs-nav {
+            display: flex;
+            background: #f1f5f9;
+            border-bottom: 2px solid var(--card-border);
+            padding: 0.5rem 2rem 0;
+            gap: 0.5rem;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            outline: none;
+            padding: 0.75rem 1.5rem;
+            font-family: var(--font-family);
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            color: #64748b;
+            border-radius: 8px 8px 0 0;
+            transition: all 0.2s ease-in-out;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tab-btn:hover {
+            color: var(--primary);
+            background-color: #e2e8f0;
+        }
+
+        .tab-btn.active {
+            color: var(--primary);
+            background-color: white;
+            border-top: 3px solid var(--primary-light);
+            box-shadow: 0 -4px 6px -1px rgb(0 0 0 / 0.05);
+        }
+
+        /* Layout Main Containers */
+        main {
+            padding: 2rem;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Common Components Grid */
+        .grid-container {
+            display: grid;
+            grid-template-columns: 1fr 1.5fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 968px) {
+            .grid-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Cards Panel Styling */
+        .card {
+            background-color: white;
+            border-radius: 12px;
+            border: 1px solid var(--card-border);
+            box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+            padding: 1.75rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card-title {
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: var(--text-heading);
+            margin-bottom: 1.25rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #f1f5f9;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Form Components */
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #475569;
+            margin-bottom: 0.4rem;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 0.65rem 0.85rem;
+            font-family: var(--font-family);
+            font-size: 0.95rem;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            background-color: white;
+            color: var(--text-slate);
+            outline: none;
+            transition: border-color 0.15s ease-in-out;
+        }
+
+        .form-control:focus {
+            border-color: var(--primary-light);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        /* Buttons Group Styling */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.65rem 1.25rem;
+            font-family: var(--font-family);
+            font-size: 0.95rem;
+            font-weight: 600;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.15s ease-in-out;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background-color: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background-color: var(--primary-light);
+        }
+
+        .btn-secondary {
+            background-color: #e2e8f0;
+            color: #475569;
+        }
+
+        .btn-secondary:hover {
+            background-color: #cbd5e1;
+        }
+
+        .btn-success {
+            background-color: var(--success);
+            color: white;
+        }
+
+        .btn-success:hover {
+            background-color: #15803d;
+        }
+
+        .btn-danger {
+            background-color: var(--danger);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background-color: #b91c1c;
+        }
+
+        .btn-outline {
+            background: none;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+        }
+
+        .btn-outline:hover {
+            background-color: rgba(30, 58, 138, 0.05);
+        }
+
+        /* Blocks Search and Listing styling */
+        .block-list {
+            max-height: 500px;
+            overflow-y: auto;
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            background-color: #f8fafc;
+        }
+
+        .block-item {
+            padding: 1rem;
+            border-bottom: 1px solid var(--card-border);
+            cursor: pointer;
+            transition: background-color 0.15s ease-in-out;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .block-item:last-child {
+            border-bottom: none;
+        }
+
+        .block-item:hover {
+            background-color: #f1f5f9;
+        }
+
+        .block-item.active {
+            background-color: #dbeafe;
+            border-left: 4px solid var(--primary-light);
+        }
+
+        /* Badge indicators */
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.65rem;
+            border-radius: 50px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .badge-pending { background-color: #fef3c7; color: #d97706; }
+        .badge-measured { background-color: #dbeafe; color: #1e40af; }
+        .badge-approved { background-color: #dcfce7; color: #15803d; }
+        .badge-rejected { background-color: #fee2e2; color: #b91c1c; }
+
+        /* Measurement HUD metrics styling */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .metric-card {
+            background-color: #f8fafc;
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--text-heading);
+            margin: 0.25rem 0;
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: #64748b;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        /* Visual Media Preview columns */
+        .media-preview-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        @media (max-width: 600px) {
+            .media-preview-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .media-box {
+            border: 2px dashed #cbd5e1;
+            border-radius: 8px;
+            padding: 0.5rem;
+            background-color: #fafafa;
+            text-align: center;
+            min-height: 250px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .media-box img {
+            max-width: 100%;
+            max-height: 280px;
+            border-radius: 4px;
+            object-fit: contain;
+        }
+
+        /* Timeline Audit history styling */
+        .timeline {
+            border-left: 2px solid #cbd5e1;
+            padding-left: 1.5rem;
+            margin-left: 0.5rem;
+            position: relative;
+        }
+
+        .timeline-item {
+            position: relative;
+            margin-bottom: 1.25rem;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -1.95rem;
+            top: 0.25rem;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--primary-light);
+            border: 2px solid white;
+        }
+
+        .timeline-time {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            font-weight: 600;
+        }
+
+        .timeline-title {
+            font-weight: 700;
+            color: var(--text-heading);
+            font-size: 0.9rem;
+        }
+
+        .timeline-desc {
+            font-size: 0.85rem;
+            color: #64748b;
+        }
+
+        /* Disclaimer alerts */
+        .disclaimer-alert {
+            background-color: #fffbeb;
+            border: 1px solid #fef3c7;
+            border-radius: 8px;
+            padding: 1rem;
+            color: #b45309;
+            font-size: 0.85rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .disclaimer-icon {
+            font-weight: bold;
+            font-size: 1.2rem;
+        }
+
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--primary-light);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Top Gov Banner -->
+    <header>
+        <div class="header-brand">
+            <div class="gov-seal-placeholder">AP</div>
+            <div class="header-title">
+                <h1>Granite Block Sizing & Seigniorage Portal</h1>
+                <p>Govt. of Andhra Pradesh • Dept. of Mines & Geology (POC)</p>
+            </div>
+        </div>
+        <div>
+            <span style="font-size: 0.85rem; background: rgba(255,255,255,0.15); padding: 0.4rem 0.8rem; border-radius: 50px; font-weight: 600;">
+                Secure Officer Session
+            </span>
+        </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs-nav">
+        <button class="tab-btn active" onclick="switchTab('field-capture')">
+            📷 Field Capture Interface
+        </button>
+        <button class="tab-btn" onclick="switchTab('supervisor-dashboard'); loadSupervisorBlocks();">
+            📊 Supervisor Dashboard
+        </button>
+    </nav>
+
+    <!-- Main Content -->
+    <main>
+        
+        <!-- Tab 1: Field Capture Interface -->
+        <div id="field-capture" class="tab-content active">
+            <div class="grid-container">
+                
+                <!-- Registration and Inputs -->
+                <div class="column">
+                    <div class="card">
+                        <div class="card-title">Block Registry & GPS Setup</div>
+                        
+                        <div class="form-group">
+                            <label for="fc-quarry-id">Select Quarry Reference ID</label>
+                            <select id="fc-quarry-id" class="form-control">
+                                <option value="">-- Fetching Quarries --</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="fc-block-id">Block Number / ID</label>
+                            <input type="text" id="fc-block-id" class="form-control" placeholder="e.g. AP-GRANITE-049">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>GPS Coordinates</label>
+                            <div class="form-row" style="margin-bottom: 0.5rem;">
+                                <input type="number" step="0.000001" id="fc-lat" class="form-control" placeholder="Latitude">
+                                <input type="number" step="0.000001" id="fc-lon" class="form-control" placeholder="Longitude">
+                            </div>
+                            <button type="button" class="btn btn-secondary" onclick="captureGPS()" style="width: 100%;">
+                                📍 Capture Device Location
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title">Computer Vision Image Upload</div>
+                        <div class="form-group">
+                            <label for="fc-image-file">Upload Granite Block Photograph (Ensure Markers Visible)</label>
+                            <input type="file" id="fc-image-file" class="form-control" accept="image/*">
+                        </div>
+                        
+                        <button type="button" id="fc-submit-btn" class="btn btn-primary" onclick="submitBlockCV()" style="width: 100%;">
+                            ⚡ Analyze Block & Estimate Volume
+                        </button>
+                        
+                        <div id="fc-loader-container" style="display: none; flex-direction: column; align-items: center; margin-top: 1rem;">
+                            <div class="loader"></div>
+                            <p style="font-size: 0.85rem; margin-top: 0.5rem; font-weight: 600;">Running Computer Vision Pipeline (YOLOv8 & Pose)...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- CV Result Displays -->
+                <div class="column">
+                    <div class="card" id="fc-result-card" style="display: none;">
+                        <div class="card-title">
+                            Measurement Output (POC)
+                            <span id="fc-status-badge" class="badge">Success</span>
+                        </div>
+                        
+                        <div class="metrics-grid">
+                            <div class="metric-card">
+                                <div class="metric-value" id="fc-res-len">0.00</div>
+                                <div class="metric-label">Length (m)</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="fc-res-brd">0.00</div>
+                                <div class="metric-label">Breadth (m)</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="fc-res-hgt">0.00</div>
+                                <div class="metric-label">Height (m)</div>
+                            </div>
+                            <div class="metric-card" style="background-color: #eff6ff; border-color: #bfdbfe;">
+                                <div class="metric-value" id="fc-res-vol" style="color: var(--primary-light);">0.0000</div>
+                                <div class="metric-label">Volume (m³)</div>
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom: 1rem; display: flex; justify-content: space-between; font-size: 0.85rem;">
+                            <span>CV System Confidence: <strong id="fc-res-conf">0.00</strong></span>
+                            <span>Inspection Method: <strong style="text-transform: uppercase;">Computer Vision</strong></span>
+                        </div>
+
+                        <!-- Image Displays -->
+                        <div class="media-preview-container">
+                            <div class="media-box">
+                                <div class="metric-label" style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.6); color: white; padding: 0.2rem 0.5rem; border-radius: 4px;">Raw Image</div>
+                                <img id="fc-img-raw" src="" alt="Raw block image">
+                            </div>
+                            <div class="media-box">
+                                <div class="metric-label" style="position: absolute; top: 5px; left: 5px; background: rgba(30,58,138,0.8); color: white; padding: 0.2rem 0.5rem; border-radius: 4px;">CV Overlay</div>
+                                <img id="fc-img-ann" src="" alt="Annotated block image">
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 1.5rem; display: flex; gap: 1rem;">
+                            <button class="btn btn-success" onclick="saveMeasurement()" style="flex: 1;">
+                                ✓ Save Inspection Records
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- Tab 2: Supervisor Dashboard / Reporting -->
+        <div id="supervisor-dashboard" class="tab-content">
+            <div class="grid-container">
+                
+                <!-- Left panel: search and listing -->
+                <div class="column">
+                    <div class="card">
+                        <div class="card-title">Inspection Records</div>
+                        
+                        <div class="form-group">
+                            <input type="text" id="sd-search" class="form-control" placeholder="Search by Block ID..." onkeyup="filterBlocks()">
+                        </div>
+
+                        <div class="block-list" id="sd-block-list">
+                            <!-- Populated dynamically -->
+                            <div style="padding: 1.5rem; text-align: center; color: #94a3b8;">Loading records...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right panel: details, actions, and PDF reports -->
+                <div class="column">
+                    <div id="sd-details-card" class="card" style="display: none;">
+                        <div class="card-title">
+                            Block Details: <span id="sd-det-id" style="color: var(--primary);">AP-GRANITE-049</span>
+                            <span id="sd-det-badge" class="badge badge-pending">Pending</span>
+                        </div>
+
+                        <!-- Info grid -->
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; font-size: 0.9rem;">
+                            <div>
+                                <p><strong>Quarry ID:</strong> <span id="sd-det-quarry">N/A</span></p>
+                                <p><strong>GPS Latitude:</strong> <span id="sd-det-lat">N/A</span></p>
+                                <p><strong>GPS Longitude:</strong> <span id="sd-det-lon">N/A</span></p>
+                                <p><strong>Capture Time:</strong> <span id="sd-det-time">N/A</span></p>
+                            </div>
+                            <div>
+                                <p><strong>Approval Status:</strong> <span id="sd-det-app-status">Pending</span></p>
+                                <p><strong>Action Officer:</strong> <span id="sd-det-app-officer">N/A</span></p>
+                                <p><strong>Action Time:</strong> <span id="sd-det-app-time">N/A</span></p>
+                                <p><strong>CV Status:</strong> <span id="sd-det-cv-status">N/A</span></p>
+                            </div>
+                        </div>
+
+                        <!-- Current active measurements -->
+                        <div class="card-title" style="font-size: 1rem; border-bottom: 1px solid var(--card-border); padding-bottom: 0.25rem;">Active Geometric Measurements</div>
+                        <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                            <div class="metric-card">
+                                <div class="metric-value" id="sd-det-len">0.00</div>
+                                <div class="metric-label">Length (m)</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="sd-det-brd">0.00</div>
+                                <div class="metric-label">Breadth (m)</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="sd-det-hgt">0.00</div>
+                                <div class="metric-label">Height (m)</div>
+                            </div>
+                            <div class="metric-card" style="background-color: #f0fdf4; border-color: #bbf7d0;">
+                                <div class="metric-value" id="sd-det-vol" style="color: var(--success);">0.0000</div>
+                                <div class="metric-label">Volume (m³)</div>
+                            </div>
+                        </div>
+
+                        <!-- Original CV snapshots if manually overridden -->
+                        <div id="sd-orig-box" style="display: none; background-color: #fee2e2; border: 1px solid #fecaca; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;">
+                            <h4 style="color: #b91c1c; font-size: 0.9rem; margin-bottom: 0.5rem; font-weight: 700;">⚠ Original CV Measurements Snapshot</h4>
+                            <div style="display: grid; grid-template-columns: repeat(4, 1fr); text-align: center; font-size: 0.85rem;">
+                                <div><strong>L:</strong> <span id="sd-orig-len">0.00</span>m</div>
+                                <div><strong>B:</strong> <span id="sd-orig-brd">0.00</span>m</div>
+                                <div><strong>H:</strong> <span id="sd-orig-hgt">0.00</span>m</div>
+                                <div><strong>Vol:</strong> <span id="sd-orig-vol">0.0000</span>m³</div>
+                            </div>
+                            <p style="margin-top: 0.5rem; font-size: 0.8rem; color: #7f1d1d;"><strong>Override Reason:</strong> <span id="sd-orig-reason"></span></p>
+                        </div>
+
+                        <!-- Interactive Images toggle/preview -->
+                        <div class="media-preview-container">
+                            <div class="media-box">
+                                <div class="metric-label" style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.6); color: white; padding: 0.2rem 0.5rem; border-radius: 4px;">Raw Photograph</div>
+                                <img id="sd-img-raw" src="" alt="Raw photo">
+                            </div>
+                            <div class="media-box">
+                                <div class="metric-label" style="position: absolute; top: 5px; left: 5px; background: rgba(30,58,138,0.8); color: white; padding: 0.2rem 0.5rem; border-radius: 4px;">CV Analysis</div>
+                                <img id="sd-img-ann" src="" alt="CV output">
+                            </div>
+                        </div>
+
+                        <!-- Supervision control center -->
+                        <div style="margin-top: 1.5rem; display: flex; flex-wrap: wrap; gap: 0.75rem;">
+                            <button class="btn btn-success" onclick="approveBlock('approved')">Approve Measurement</button>
+                            <button class="btn btn-danger" onclick="approveBlock('rejected')">Reject Block</button>
+                            <button class="btn btn-secondary" onclick="toggleOverrideForm()">✏ Manual Override</button>
+                            <a id="sd-pdf-btn" href="" target="_blank" class="btn btn-outline">🖨 Download PDF Report</a>
+                        </div>
+
+                        <!-- Manual Override Overlay Form -->
+                        <div id="sd-override-form" class="card" style="display: none; margin-top: 1.5rem; background-color: #f8fafc; border-color: #cbd5e1;">
+                            <div class="card-title" style="font-size: 1rem;">Manual Override Inputs</div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ov-len">Length (m)</label>
+                                    <input type="number" step="0.01" id="ov-len" class="form-control">
+                                </div>
+                                <div class="form-group">
+                                    <label for="ov-brd">Breadth (m)</label>
+                                    <input type="number" step="0.01" id="ov-brd" class="form-control">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ov-hgt">Height (m)</label>
+                                    <input type="number" step="0.01" id="ov-hgt" class="form-control">
+                                </div>
+                                <div class="form-group">
+                                    <label for="ov-actor">Officer Name</label>
+                                    <input type="text" id="ov-actor" class="form-control" value="Mining Officer">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="ov-reason">Reason for Manual Override</label>
+                                <input type="text" id="ov-reason" class="form-control" placeholder="e.g. Marker corner occluded by wet mud">
+                            </div>
+                            <button class="btn btn-primary" onclick="submitOverride()" style="width: 100%;">Submit Override Dimensions</button>
+                        </div>
+
+                        <!-- Assessment and calculations panel -->
+                        <div id="sd-assessment-box" class="card" style="margin-top: 1.5rem; border-color: #bfdbfe; background-color: #eff6ff;">
+                            <div class="card-title" style="font-size: 1rem; border-color: #bfdbfe;">
+                                Seigniorage Assessment (POC Rates)
+                                <button class="btn btn-primary" onclick="loadAssessment()" style="padding: 0.3rem 0.75rem; font-size: 0.8rem;">
+                                    ↺ Calculate Assessment
+                                </button>
+                            </div>
+                            
+                            <div class="disclaimer-alert">
+                                <span class="disclaimer-icon">⚠</span>
+                                <div>
+                                    <strong>POC Indicative Billing Alert:</strong> Rates and calculations shown below are based on the experimental POC tariff scheduler. They do not represent official billing values.
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ass-cat">Granite Category</label>
+                                    <select id="ass-cat" class="form-control" onchange="triggerAssessmentSave()">
+                                        <option value="Premium">Premium</option>
+                                        <option value="Standard">Standard</option>
+                                        <option value="Commercial">Commercial</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="ass-cls">Gangsaw Classification</label>
+                                    <select id="ass-cls" class="form-control" onchange="triggerAssessmentSave()">
+                                        <option value="Gangsaw Size">Gangsaw Size</option>
+                                        <option value="Mini Gangsaw Size">Mini Gangsaw Size</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ass-den">Density (MT/m³)</label>
+                                    <input type="number" step="0.1" id="ass-den" class="form-control" value="2.7" onchange="triggerAssessmentSave()">
+                                </div>
+                                <div class="form-group">
+                                    <label>Calculated Metric Weight</label>
+                                    <input type="text" id="ass-weight" class="form-control" readonly style="background-color: #e2e8f0;">
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>POC Tariff Rate (per MT)</label>
+                                    <input type="text" id="ass-rate" class="form-control" readonly style="background-color: #e2e8f0;">
+                                </div>
+                                <div class="form-group">
+                                    <label style="color: var(--primary); font-weight: 700;">Indicative Seigniorage Fee</label>
+                                    <input type="text" id="ass-seigniorage" class="form-control" readonly style="background-color: #e2e8f0; font-weight: 700; color: var(--primary);">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Action Audit Logs Timeline -->
+                        <div class="card" style="margin-top: 1.5rem;">
+                            <div class="card-title" style="font-size: 1rem;">Action & Supervision History</div>
+                            <div class="timeline" id="sd-timeline">
+                                <!-- Populated dynamically -->
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Main Client-Side Application Javascript -->
+    <script>
+        // Global variables
+        let blocksCache = [];
+        let selectedBlockId = null;
+
+        // Switch navigation tabs
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            
+            document.getElementById(tabId).classList.add('active');
+            event.currentTarget.classList.add('active');
+        }
+
+        // ----------------------------------------------------
+        // FIELD CAPTURE CODE
+        // ----------------------------------------------------
+        
+        // Capture browser Geolocation coordinates
+        function captureGPS() {
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition(position => {
+                    document.getElementById('fc-lat').value = position.coords.latitude.toFixed(6);
+                    document.getElementById('fc-lon').value = position.coords.longitude.toFixed(6);
+                }, err => {
+                    alert("GPS extraction failed. Please enter coordinates manually.");
+                });
+            } else {
+                alert("GPS extraction is not supported on this device.");
+            }
+        }
+
+        // Initialize lists (Quarries list selection)
+        async function initFieldCapture() {
+            try {
+                // Fetch blocks to lookup quarries (or dummy fallback if no endpoints)
+                const res = await fetch('/api/blocks/');
+                const data = await res.json();
+                
+                const select = document.getElementById('fc-quarry-id');
+                select.innerHTML = '';
+                
+                // Add default test quarry options
+                const testQuarries = [
+                    { id: 'Q-9982', name: 'AP Mines - Chimakurthy Main Quarry' },
+                    { id: 'Q-0419', name: 'Standard Black Granite Quarry' },
+                    { id: 'Q-5561', name: 'Premium Galaxy Granite Mines' }
+                ];
+                
+                testQuarries.forEach(q => {
+                    const opt = document.createElement('option');
+                    opt.value = q.id;
+                    opt.textContent = q.name;
+                    select.appendChild(opt);
+                });
+            } catch (err) {
+                console.error("Failed to fetch quarries", err);
+            }
+        }
+
+        // Upload and trigger CV API sizing
+        async function submitBlockCV() {
+            const blockId = document.getElementById('fc-block-id').value.trim();
+            const quarryId = document.getElementById('fc-quarry-id').value;
+            const lat = document.getElementById('fc-lat').value;
+            const lon = document.getElementById('fc-lon').value;
+            const fileInput = document.getElementById('fc-image-file');
+
+            if (!blockId) {
+                alert("Please enter a valid Block ID.");
+                return;
+            }
+            if (fileInput.files.length === 0) {
+                alert("Please select a block photograph to upload.");
+                return;
+            }
+
+            document.getElementById('fc-loader-container').style.display = 'flex';
+            document.getElementById('fc-result-card').style.display = 'none';
+
+            try {
+                // 1. Create a placeholder block first in pending state with GPS coordinates
+                const blockPayload = {
+                    block_id: blockId,
+                    quarry_id: quarryId,
+                    gps_latitude: lat ? parseFloat(lat) : null,
+                    gps_longitude: lon ? parseFloat(lon) : null,
+                    status: 'pending'
+                };
+                
+                await fetch('/api/blocks/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(blockPayload)
+                });
+
+                // 2. Upload image and execute CV sizing run
+                const formData = new FormData();
+                formData.append('image', fileInput.files[0]);
+
+                const cvRes = await fetch(`/api/blocks/${blockId}/measure-cv/`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const cvData = await cvRes.json();
+                document.getElementById('fc-loader-container').style.display = 'none';
+
+                if (cvRes.ok) {
+                    // Populate happy path output values
+                    document.getElementById('fc-res-len').textContent = cvData.measurement.length_m.toFixed(2);
+                    document.getElementById('fc-res-brd').textContent = cvData.measurement.breadth_m.toFixed(2);
+                    document.getElementById('fc-res-hgt').textContent = cvData.measurement.height_m.toFixed(2);
+                    document.getElementById('fc-res-vol').textContent = cvData.measurement.volume_m3.toFixed(4);
+                    document.getElementById('fc-res-conf').textContent = cvData.measurement.confidence.toFixed(2);
+                    
+                    document.getElementById('fc-img-raw').src = '/media/' + cvData.raw_image_path;
+                    document.getElementById('fc-img-ann').src = '/media/' + cvData.annotated_image_path;
+                    
+                    document.getElementById('fc-status-badge').textContent = 'Success';
+                    document.getElementById('fc-status-badge').className = 'badge badge-measured';
+                    document.getElementById('fc-result-card').style.display = 'block';
+                } else {
+                    // Trigger fail tracking layout
+                    alert(`Computer Vision Warning: ${cvData.error || 'Measurement failed.'}`);
+                    
+                    // Show block info with fail log details
+                    document.getElementById('fc-res-len').textContent = '0.00';
+                    document.getElementById('fc-res-brd').textContent = '0.00';
+                    document.getElementById('fc-res-hgt').textContent = '0.00';
+                    document.getElementById('fc-res-vol').textContent = '0.0000';
+                    document.getElementById('fc-res-conf').textContent = '0.00';
+                    
+                    // Attempt to show raw image at least
+                    document.getElementById('fc-img-raw').src = fileInput.files[0] ? URL.createObjectURL(fileInput.files[0]) : '';
+                    document.getElementById('fc-img-ann').src = '';
+                    
+                    document.getElementById('fc-status-badge').textContent = 'CV Failed';
+                    document.getElementById('fc-status-badge').className = 'badge badge-rejected';
+                    document.getElementById('fc-result-card').style.display = 'block';
+                }
+            } catch (err) {
+                document.getElementById('fc-loader-container').style.display = 'none';
+                alert(`Error communicating with backend: ${err}`);
+            }
+        }
+
+        function saveMeasurement() {
+            alert("Measurement inspection saved successfully. Record forwarded to supervisor for review.");
+            // Reset form
+            document.getElementById('fc-block-id').value = '';
+            document.getElementById('fc-lat').value = '';
+            document.getElementById('fc-lon').value = '';
+            document.getElementById('fc-image-file').value = '';
+            document.getElementById('fc-result-card').style.display = 'none';
+        }
+
+        // ----------------------------------------------------
+        // SUPERVISOR DASHBOARD CODE
+        // ----------------------------------------------------
+        
+        async function loadSupervisorBlocks() {
+            try {
+                const res = await fetch('/api/blocks/');
+                const data = await res.json();
+                blocksCache = data;
+                renderBlocksList(data);
+            } catch (err) {
+                console.error("Failed to load blocks list", err);
+            }
+        }
+
+        function renderBlocksList(blocks) {
+            const list = document.getElementById('sd-block-list');
+            list.innerHTML = '';
+            
+            if (blocks.length === 0) {
+                list.innerHTML = '<div style="padding: 1.5rem; text-align: center; color: #94a3b8;">No blocks found.</div>';
+                return;
+            }
+
+            blocks.forEach(b => {
+                const item = document.createElement('div');
+                item.className = `block-item ${selectedBlockId === b.block_id ? 'active' : ''}`;
+                item.onclick = () => selectBlock(b.block_id);
+                
+                const leftDiv = document.createElement('div');
+                leftDiv.innerHTML = `<strong>${b.block_id}</strong><div style="font-size:0.75rem; color:#64748b;">${b.quarry_id || 'No Quarry'}</div>`;
+                
+                const rightDiv = document.createElement('div');
+                let appClass = 'badge-pending';
+                if (b.approval_status === 'approved') appClass = 'badge-approved';
+                if (b.approval_status === 'rejected') appClass = 'badge-rejected';
+                
+                rightDiv.innerHTML = `<span class="badge ${appClass}">${b.approval_status || 'pending'}</span>`;
+                
+                item.appendChild(leftDiv);
+                item.appendChild(rightDiv);
+                list.appendChild(item);
+            });
+        }
+
+        function filterBlocks() {
+            const query = document.getElementById('sd-search').value.toLowerCase();
+            const filtered = blocksCache.filter(b => b.block_id.toLowerCase().includes(query));
+            renderBlocksList(filtered);
+        }
+
+        async function selectBlock(blockId) {
+            selectedBlockId = blockId;
+            
+            // Re-render list active state
+            document.querySelectorAll('.block-item').forEach(el => {
+                el.classList.remove('active');
+                if (el.querySelector('strong').textContent === blockId) {
+                    el.classList.add('active');
+                }
+            });
+
+            const block = blocksCache.find(b => b.block_id === blockId);
+            if (!block) return;
+
+            document.getElementById('sd-det-id').textContent = block.block_id;
+            document.getElementById('sd-det-quarry').textContent = block.quarry_id || 'N/A';
+            document.getElementById('sd-det-lat').textContent = block.gps_latitude || 'N/A';
+            document.getElementById('sd-det-lon').textContent = block.gps_longitude || 'N/A';
+            document.getElementById('sd-det-time').textContent = block.captured_at ? new Date(block.captured_at).toLocaleString() : 'N/A';
+            
+            const badge = document.getElementById('sd-det-badge');
+            badge.textContent = block.approval_status || 'pending';
+            badge.className = `badge badge-${block.approval_status || 'pending'}`;
+            
+            document.getElementById('sd-det-app-status').textContent = block.approval_status || 'Pending Review';
+            document.getElementById('sd-det-app-officer').textContent = block.approved_by || 'N/A';
+            document.getElementById('sd-det-app-time').textContent = block.approved_at ? new Date(block.approved_at).toLocaleString() : 'N/A';
+            document.getElementById('sd-det-cv-status').textContent = block.cv_status ? block.cv_status.toUpperCase() : 'PENDING';
+
+            // Active measurements
+            if (block.measurement) {
+                document.getElementById('sd-det-len').textContent = block.measurement.length_m.toFixed(2);
+                document.getElementById('sd-det-brd').textContent = block.measurement.breadth_m.toFixed(2);
+                document.getElementById('sd-det-hgt').textContent = block.measurement.height_m.toFixed(2);
+                document.getElementById('sd-det-vol').textContent = block.measurement.volume_m3.toFixed(4);
+            } else {
+                document.getElementById('sd-det-len').textContent = '0.00';
+                document.getElementById('sd-det-brd').textContent = '0.00';
+                document.getElementById('sd-det-hgt').textContent = '0.00';
+                document.getElementById('sd-det-vol').textContent = '0.0000';
+            }
+
+            // Original CV boxes if overridden
+            if (block.is_overridden && block.original_measurement) {
+                document.getElementById('sd-orig-len').textContent = block.original_measurement.length_m.toFixed(2);
+                document.getElementById('sd-orig-brd').textContent = block.original_measurement.breadth_m.toFixed(2);
+                document.getElementById('sd-orig-hgt').textContent = block.original_measurement.height_m.toFixed(2);
+                document.getElementById('sd-orig-vol').textContent = block.original_measurement.volume_m3.toFixed(4);
+                document.getElementById('sd-orig-reason').textContent = block.override_reason || 'None stated';
+                document.getElementById('sd-orig-box').style.display = 'block';
+            } else {
+                document.getElementById('sd-orig-box').style.display = 'none';
+            }
+
+            // Image paths loading
+            document.getElementById('sd-img-raw').src = block.raw_image_path ? '/media/' + block.raw_image_path : '';
+            document.getElementById('sd-img-ann').src = block.annotated_image_path ? '/media/' + block.annotated_image_path : '';
+
+            // PDF setup
+            document.getElementById('sd-pdf-btn').href = `/api/blocks/${block.block_id}/pdf/`;
+
+            // Reset forms
+            document.getElementById('sd-override-form').style.display = 'none';
+            
+            // Clean/Load assessment details
+            await fetchAssessmentDetails(blockId);
+            // Load history timeline
+            await fetchTimeline(blockId);
+
+            document.getElementById('sd-details-card').style.display = 'block';
+        }
+
+        async function fetchTimeline(blockId) {
+            try {
+                const res = await fetch(`/api/blocks/${blockId}/audit-logs/`);
+                if (res.ok) {
+                    const logs = await res.json();
+                    const timeline = document.getElementById('sd-timeline');
+                    timeline.innerHTML = '';
+                    
+                    if (logs.length === 0) {
+                        timeline.innerHTML = '<div style="font-size:0.85rem; color:#94a3b8;">No history logs registered.</div>';
+                        return;
+                    }
+
+                    logs.forEach(log => {
+                        const item = document.createElement('div');
+                        item.className = 'timeline-item';
+                        item.innerHTML = `
+                            <div class="timeline-time">${log.timestamp}</div>
+                            <div class="timeline-title">${log.action.replace('_', ' ').toUpperCase()} (by ${log.actor})</div>
+                            <div class="timeline-desc">${log.details}</div>
+                        `;
+                        timeline.appendChild(item);
+                    });
+                }
+            } catch (err) {
+                console.error("Failed to load audit logs", err);
+            }
+        }
+
+        async function fetchAssessmentDetails(blockId) {
+            try {
+                const res = await fetch(`/api/assessments/${blockId}/`);
+                if (res.ok) {
+                    const ass = await res.json();
+                    document.getElementById('ass-cat').value = ass.granite_category;
+                    document.getElementById('ass-cls').value = ass.gangsaw_classification;
+                    document.getElementById('ass-den').value = ass.density_mt_per_m3;
+                    document.getElementById('ass-weight').value = ass.weight_mt.toFixed(3) + ' MT';
+                    document.getElementById('ass-rate').value = 'INR ' + ass.rate_per_mt.toLocaleString();
+                    document.getElementById('ass-seigniorage').value = 'INR ' + ass.indicative_seigniorage.toLocaleString();
+                } else {
+                    // Reset fields
+                    document.getElementById('ass-weight').value = 'N/A';
+                    document.getElementById('ass-rate').value = 'N/A';
+                    document.getElementById('ass-seigniorage').value = 'N/A';
+                }
+            } catch (err) {
+                console.error("Failed to load assessment", err);
+            }
+        }
+
+        async function loadAssessment() {
+            if (!selectedBlockId) return;
+            
+            const cat = document.getElementById('ass-cat').value;
+            const cls = document.getElementById('ass-cls').value;
+            const den = parseFloat(document.getElementById('ass-den').value);
+
+            try {
+                const res = await fetch('/api/assessments/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        block_id: selectedBlockId,
+                        granite_category: cat,
+                        gangsaw_classification: cls,
+                        density: den
+                    })
+                });
+
+                if (res.ok) {
+                    const ass = await res.json();
+                    document.getElementById('ass-weight').value = ass.weight_mt.toFixed(3) + ' MT';
+                    document.getElementById('ass-rate').value = 'INR ' + ass.rate_per_mt.toLocaleString();
+                    document.getElementById('ass-seigniorage').value = 'INR ' + ass.indicative_seigniorage.toLocaleString();
+                    alert("Assessment updated & saved successfully.");
+                    await fetchTimeline(selectedBlockId);
+                } else {
+                    const errData = await res.json();
+                    alert(`Error running assessment: ${errData.error || 'Failed calculation.'}`);
+                }
+            } catch (err) {
+                alert(`Error calculating: ${err}`);
+            }
+        }
+
+        async function triggerAssessmentSave() {
+            // Trigger automatic calculation updates on selector changes
+            if (selectedBlockId) {
+                const weight = document.getElementById('ass-weight').value;
+                if (weight !== 'N/A' && weight !== '') {
+                    await loadAssessment();
+                }
+            }
+        }
+
+        function toggleOverrideForm() {
+            const form = document.getElementById('sd-override-form');
+            form.style.display = form.style.display === 'none' ? 'block' : 'none';
+            
+            // Populate defaults with active dimensions
+            const block = blocksCache.find(b => b.block_id === selectedBlockId);
+            if (block && block.measurement) {
+                document.getElementById('ov-len').value = block.measurement.length_m;
+                document.getElementById('ov-brd').value = block.measurement.breadth_m;
+                document.getElementById('ov-hgt').value = block.measurement.height_m;
+            }
+        }
+
+        async function submitOverride() {
+            const len = parseFloat(document.getElementById('ov-len').value);
+            const brd = parseFloat(document.getElementById('ov-brd').value);
+            const hgt = parseFloat(document.getElementById('ov-hgt').value);
+            const reason = document.getElementById('ov-reason').value.trim();
+            const actor = document.getElementById('ov-actor').value.trim();
+
+            if (isNaN(len) || isNaN(brd) || isNaN(hgt)) {
+                alert("Please enter valid decimal values for dimensions.");
+                return;
+            }
+            if (!reason) {
+                alert("Please state a justification reason for manually overriding the dimensions.");
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/blocks/${selectedBlockId}/override/`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        length_m: len,
+                        breadth_m: brd,
+                        height_m: hgt,
+                        reason: reason,
+                        actor: actor
+                    })
+                });
+
+                if (res.ok) {
+                    alert("Manual override submitted and audit log generated.");
+                    // Reload caching list
+                    await loadSupervisorBlocks();
+                    await selectBlock(selectedBlockId);
+                } else {
+                    const err = await res.json();
+                    alert(`Override failed: ${err.error}`);
+                }
+            } catch (err) {
+                alert(`Error submitting override: ${err}`);
+            }
+        }
+
+        async function approveBlock(statusValue) {
+            const officer = prompt("Enter Supervisor Name/ID to authorize:", "Supervisor Officer");
+            if (!officer) return;
+
+            try {
+                const res = await fetch(`/api/blocks/${selectedBlockId}/approve/`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        approval_status: statusValue,
+                        actor: officer
+                    })
+                });
+
+                if (res.ok) {
+                    alert(`Block status updated: ${statusValue.toUpperCase()}`);
+                    await loadSupervisorBlocks();
+                    await selectBlock(selectedBlockId);
+                } else {
+                    const err = await res.json();
+                    alert(`Approval update failed: ${err.error}`);
+                }
+            } catch (err) {
+                alert(`Error: ${err}`);
+            }
+        }
+
+        // Initialize application on load
+        window.addEventListener('DOMContentLoaded', () => {
+            initFieldCapture();
+        });
+    </script>
+</body>
+</html>
