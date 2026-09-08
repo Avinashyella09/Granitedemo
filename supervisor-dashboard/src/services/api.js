@@ -22,11 +22,19 @@ export const clearApiCache = () => {
 
 export const apiService = {
   getBlocks: async () => {
-    return fetchCached('/api/blocks/');
+    // Always fetch fresh block registry data directly from Django API
+    const res = await fetch('/api/blocks/');
+    if (!res.ok) throw new Error(`HTTP error ${res.status} for /api/blocks/`);
+    const data = await res.json();
+    // Cache under /api/blocks/ for immediate sync fallback if needed
+    _cache.set('/api/blocks/', { timestamp: Date.now(), data });
+    return data;
   },
 
   getBlock: async (blockId) => {
-    return fetchCached(`/api/blocks/${blockId}/`);
+    const res = await fetch(`/api/blocks/${blockId}/`);
+    if (!res.ok) throw new Error(`HTTP error ${res.status} for /api/blocks/${blockId}/`);
+    return res.json();
   },
 
   approveBlock: async (blockId, payload) => {

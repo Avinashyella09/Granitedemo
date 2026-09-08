@@ -9,6 +9,9 @@ import hashlib
 import threading
 import time
 import cv2
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # SHARED ANALYTICS DATA CACHE
@@ -553,6 +556,10 @@ class BlockARMeasureAPIView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
+        import time
+        t_start = time.time()
+        logger.info(f"[PERF] Server received request at {datetime.datetime.utcnow().isoformat()}")
+
         block_id   = request.data.get('block_id', '').strip()
         quarry_id  = request.data.get('quarry_id', '').strip()
         officer_id = request.data.get('officer_id', '').strip()
@@ -576,13 +583,14 @@ class BlockARMeasureAPIView(APIView):
         if not uploaded_file:
             return Response({'error': 'image file is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        t_val = time.time()
+        logger.info(f"[PERF] Validation completed: {int((t_val - t_start)*1000)} ms")
+
         # --- Resolve or create block ---
         block = Block.objects(block_id=block_id).first()
         if block:
-            # Already exists — update with new AR measurement
             pass
         else:
-            # Resolve quarry reference
             quarry_doc = None
             if quarry_id:
                 quarry_doc = Quarry.objects(id=quarry_id).first()
@@ -623,6 +631,9 @@ class BlockARMeasureAPIView(APIView):
             for chunk in uploaded_file.chunks():
                 dst.write(chunk)
 
+        t_img = time.time()
+        logger.info(f"[PERF] Image saved to disk: {int((t_img - t_val)*1000)} ms")
+
         block.raw_image_path = os.path.relpath(raw_filepath, settings.MEDIA_ROOT).replace('\\', '/')
         block.captured_at    = datetime.datetime.utcnow()
 
@@ -647,6 +658,9 @@ class BlockARMeasureAPIView(APIView):
         block.save()
         _invalidate_cache()
 
+        t_db = time.time()
+        logger.info(f"[PERF] MongoDB write finished: {int((t_db - t_img)*1000)} ms")
+
         # --- Audit log ---
         audit = AuditLog(
             block=block,
@@ -657,7 +671,9 @@ class BlockARMeasureAPIView(APIView):
         )
         audit.save()
 
-        # --- Return full block representation ---
+        t_done = time.time()
+        logger.info(f"[PERF] Response sent: Total server time {int((t_done - t_start)*1000)} ms")
+
         output = {
             'id': str(block.id),
             'block_id': block.block_id,

@@ -53,6 +53,14 @@ export default function App() {
   const [arHeight, setArHeight]   = useState(null);
   const [arVolume, setArVolume]   = useState(null);
 
+  const [tapToken, setTapToken] = useState(0);
+  const [resetToken, setResetToken] = useState(0);
+  const [arOverlayLabels, setArOverlayLabels] = useState([]);
+  const [candidateValid, setCandidateValid] = useState(false);
+  const [trackingQuality, setTrackingQuality] = useState('GOOD');
+  const [arDiagnostics, setArDiagnostics] = useState(null);
+  const [showDiag, setShowDiag] = useState(false);
+
   // Whether we are submitting the final inspection
   const [submitting, setSubmitting] = useState(false);
 
@@ -339,7 +347,9 @@ export default function App() {
             mediaTypes:
               ImagePicker.MediaTypeOptions.Images,
             allowsEditing: false,
-            quality: 0.8
+            quality: 0.7,
+            maxWidth: 1920,
+            maxHeight: 1920,
           });
 
         if (photoResult.canceled) {
@@ -410,7 +420,9 @@ export default function App() {
             mediaTypes:
               ImagePicker.MediaTypeOptions.Images,
             allowsEditing: false,
-            quality: 0.8
+            quality: 0.7,
+            maxWidth: 1920,
+            maxHeight: 1920,
           });
 
         if (photoResult.canceled) {
@@ -802,67 +814,104 @@ export default function App() {
   // AR point selection
   // =========================================================
 
-  const handleARPointSelected =
-    (event) => {
+  const handleARPointSelected = (event) => {
+    const point = event.nativeEvent;
+    console.log('AR POINT:', point);
 
-      const point = event.nativeEvent;
+    setArPoints(previous => {
+      if (previous.length >= 4) {
+        return previous;
+      }
 
-      console.log('AR POINT:', point);
+      const dist3d = (a, b) => Math.sqrt(
+        (b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2
+      );
 
-      setArPoints(previous => {
+      // Validate distance to previous point (must be >= 5cm)
+      if (previous.length > 0) {
+        const lastP = previous[previous.length - 1];
+        const stepDist = dist3d(lastP, point);
+        if (stepDist < 0.05) {
+          Alert.alert(
+            'Point Unstable / Too Close',
+            'Selected point is too close to the previous point (< 5 cm). Please select a distinct corner.'
+          );
+          return previous;
+        }
+      }
 
-        if (previous.length >= 4) {
+      const newPoint = {
+        x: point.x,
+        y: point.y,
+        z: point.z,
+        trackable: point.trackable || 'Plane'
+      };
+
+      const nextPoints = [...previous, newPoint];
+
+      if (nextPoints.length === 1) {
+        setArDistance(null);
+        setArStatus('P1 set (Bottom-Front-Left) — aim at P2 (Bottom-Front-Right corner)');
+
+      } else if (nextPoints.length === 2) {
+        const l = dist3d(nextPoints[0], nextPoints[1]);
+        setArDistance(l);
+        setArStatus(`Length: ${l.toFixed(2)} m — aim at P3 (Top-Front-Right corner for Height)`);
+
+      } else if (nextPoints.length === 3) {
+        const h = dist3d(nextPoints[1], nextPoints[2]);
+        setArStatus(`Height: ${h.toFixed(2)} m — aim at P4 (Top-Back-Right corner for Depth/Breadth)`);
+
+      } else if (nextPoints.length === 4) {
+        // Canonical Definition:
+        // P1→P2 = Length (L)
+        // P2→P3 = Height (H)
+        // P3→P4 = Breadth/Depth (B)
+        const p1 = nextPoints[0], p2 = nextPoints[1], p3 = nextPoints[2], p4 = nextPoints[3];
+        
+        const l = dist3d(p1, p2);
+        const h = dist3d(p2, p3);
+        const b = dist3d(p3, p4);
+
+        // Vector direction analysis
+        const v1 = { x: p2.x - p1.x, y: p2.y - p1.y, z: p2.z - p1.z };
+        const v2 = { x: p3.x - p2.x, y: p3.y - p2.y, z: p3.z - p2.z };
+        const v3 = { x: p4.x - p3.x, y: p4.y - p3.y, z: p4.z - p3.z };
+
+        // Dot products for orthogonality
+        const dot12 = (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z) / (l * h);
+        const dot23 = (v2.x * v3.x + v2.y * v3.y + v2.z * v3.z) / (h * b);
+
+        const v = parseFloat((l * b * h).toFixed(4));
+        const maxFrontDim = Math.max(l, h);
+
+        // Geometry & volume sanity checks
+        const isSanelyBounded = (l >= 0.1 && l <= 10.0) && (h >= 0.1 && h <= 5.0) && (b >= 0.1 && b <= 5.0);
+        const isDepthPlausible = b <= 2.5 * maxFrontDim && v <= 25.0;
+        const isOrthogonalEnough = Math.abs(dot12) < 0.75 && Math.abs(dot23) < 0.75;
+
+        if (!isSanelyBounded || !isDepthPlausible || !isOrthogonalEnough) {
+          Alert.alert(
+            'Validation Failed',
+            'Measurement could not be validated. Geometrical vectors are inconsistent or P4 is outside expected block bounds. Please rescan the block.'
+          );
+          setArStatus('❌ Measurement could not be validated. Please rescan the block.');
           return previous;
         }
 
-        const newPoint = {
-          x: point.x,
-          y: point.y,
-          z: point.z,
-          screenX: point.screenX,
-          screenY: point.screenY,
-          trackable: point.trackable
-        };
+        setArLength(parseFloat(l.toFixed(4)));
+        setArBreadth(parseFloat(b.toFixed(4)));
+        setArHeight(parseFloat(h.toFixed(4)));
+        setArVolume(v);
 
-        const nextPoints = [...previous, newPoint];
-
-        const dist3d = (a, b) => Math.sqrt(
-          (b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2
+        setArStatus(
+          `✅ Validated: L=${l.toFixed(2)}m  B=${b.toFixed(2)}m  H=${h.toFixed(2)}m  V=${v}m³`
         );
+      }
 
-        if (nextPoints.length === 1) {
-          setArDistance(null);
-          setArStatus('P1 set — aim at P2 (far end of longest face)');
-
-        } else if (nextPoints.length === 2) {
-          const d = dist3d(nextPoints[0], nextPoints[1]);
-          setArDistance(d);
-          setArStatus(`Length: ${d.toFixed(2)} m — now tap P3 (far breadth corner)`);
-
-        } else if (nextPoints.length === 3) {
-          const d = dist3d(nextPoints[1], nextPoints[2]);
-          setArStatus(`Breadth: ${d.toFixed(2)} m — now tap P4 (top corner for height)`);
-
-        } else if (nextPoints.length === 4) {
-          // P1→P2 = Length, P2→P3 = Breadth, P3→P4 = Height
-          const l = dist3d(nextPoints[0], nextPoints[1]);
-          const b = dist3d(nextPoints[1], nextPoints[2]);
-          const h = dist3d(nextPoints[2], nextPoints[3]);
-          const v = parseFloat((l * b * h).toFixed(4));
-
-          setArLength(parseFloat(l.toFixed(4)));
-          setArBreadth(parseFloat(b.toFixed(4)));
-          setArHeight(parseFloat(h.toFixed(4)));
-          setArVolume(v);
-
-          setArStatus(
-            `✅ Done  L: ${l.toFixed(2)} m  B: ${b.toFixed(2)} m  H: ${h.toFixed(2)} m  V: ${v} m³`
-          );
-        }
-
-        return nextPoints;
-      });
-    };
+      return nextPoints;
+    });
+  };
 
   // =========================================================
   // Reset AR
@@ -876,6 +925,49 @@ export default function App() {
     setArBreadth(null);
     setArHeight(null);
     setArVolume(null);
+    setArOverlayLabels([]);
+    setCandidateValid(false);
+    setTrackingQuality('GOOD');
+    setTapToken(0);
+    setResetToken((t) => t + 1);
+  };
+
+  const handleAROverlayUpdate = (event) => {
+    const data = event.nativeEvent;
+    if (!data) return;
+
+    if (data.labels) {
+      setArOverlayLabels(data.labels);
+    }
+    if (data.candidateValid !== undefined) {
+      setCandidateValid(data.candidateValid);
+    }
+    if (data.trackingQuality) {
+      setTrackingQuality(data.trackingQuality);
+    }
+    if (data.diagnostics) {
+      setArDiagnostics(data.diagnostics);
+    }
+  };
+
+  const getARInstruction = () => {
+    if (trackingQuality === 'INSUFFICIENT') {
+      return 'Move phone slowly to scan the block';
+    }
+    switch (arPoints.length) {
+      case 0:
+        return 'Select P1 (Bottom-Front-Left corner)';
+      case 1:
+        return 'Select P2 (Bottom-Front-Right corner)';
+      case 2:
+        return 'Select P3 (Top-Front-Right corner for Height)';
+      case 3:
+        return 'Select P4 (Top-Back-Right corner for Depth)';
+      case 4:
+        return 'Measurement Validated';
+      default:
+        return 'Move phone slowly to scan the block';
+    }
   };
 
   // =========================================================
@@ -883,6 +975,7 @@ export default function App() {
   // =========================================================
 
   const handleAnalyzeBlock = async () => {
+    if (submitting) return; // Prevent double submission
 
     if (!blockId.trim()) {
       Alert.alert('Error', 'Block Number / ID is required.');
@@ -898,6 +991,9 @@ export default function App() {
       Alert.alert('Error', 'Complete the AR measurement (select all 4 points) first.');
       return;
     }
+
+    const tStart = Date.now();
+    console.log(`[PERF] Analyze start: ${new Date().toISOString()}`);
 
     setSubmitting(true);
     setScreen('cv-processing');
@@ -915,7 +1011,12 @@ export default function App() {
         height_m:      arHeight,
         volume_m3:     arVolume,
         imageUri:      imageUri,
+        ar_points:     arPoints,
+        _tStart:       tStart,
       });
+
+      const tEnd = Date.now();
+      console.log(`[PERF] Mobile received response: Total elapsed ${tEnd - tStart} ms`);
 
       // Archive locally
       const newHistoryItem = {
@@ -1414,191 +1515,161 @@ export default function App() {
          ===================================================== */}
 
       {screen === 'ar-measure' && (
-
-        <View
-          style={
-            styles.arContainer
-          }
-        >
-
+        <View style={styles.arContainer}>
           {/* Native ARCore view */}
-
           <GraniteARView
-            style={
-              styles.arView
-            }
-
-            onStatus={
-              (event) => {
-
-                const status =
-                  event.nativeEvent?.status ||
-                  'UNKNOWN';
-
-                const message =
-                  event.nativeEvent?.message;
-
-                setArStatus(
-                  message
-                    ? `${status}: ${message}`
-                    : status
-                );
-              }
-            }
-
-            onPointSelected={
-              handleARPointSelected
-            }
+            style={styles.arView}
+            tapToken={tapToken}
+            resetToken={resetToken}
+            onStatus={(event) => {
+              const status = event.nativeEvent?.status || 'UNKNOWN';
+              const message = event.nativeEvent?.message;
+              setArStatus(message ? `${status}: ${message}` : status);
+            }}
+            onPointSelected={handleARPointSelected}
+            onOverlayUpdate={handleAROverlayUpdate}
           />
 
-          {/* =================================================
-              VISUAL OVERLAY
-             ================================================= */}
+          {/* Center Target Reticle (when points < 4) */}
+          {arPoints.length < 4 && (
+            <View style={styles.reticleContainer} pointerEvents="none">
+              <View style={[styles.reticleRing, { borderColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]}>
+                <View style={[styles.reticleDot, { backgroundColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]} />
+              </View>
+            </View>
+          )}
 
-          <View
-            style={styles.arOverlay}
-            pointerEvents="box-none"
-          >
-
-            {/* Top title */}
-
+          {/* Floating Edge Distance Badges (iPhone Measure style) */}
+          {arOverlayLabels.map((lbl) => (
             <View
+              key={lbl.id}
+              style={[
+                styles.floatingDistanceBadge,
+                {
+                  left: Math.max(12, Math.min(Dimensions.get('window').width - 95, lbl.screenX - 40)),
+                  top: Math.max(85, Math.min(Dimensions.get('window').height - 180, lbl.screenY - 14)),
+                  opacity: lbl.id === 'PREVIEW' ? 0.85 : 1.0,
+                }
+              ]}
               pointerEvents="none"
             >
-
-              <Text
-                style={
-                  styles.arTitle
-                }
-              >
-                New Block Inspection — AR Measurement
-              </Text>
-
-              <Text
-                style={
-                  styles.arStatus
-                }
-              >
-                {arStatus}
-              </Text>
-
-              <Text
-                style={
-                  styles.arInstruction
-                }
-              >
-                P1→P2 = Length · P2→P3 = Breadth · P3→P4 = Height
-              </Text>
-
+              <Text style={styles.floatingDistanceText}>{lbl.text}</Text>
             </View>
+          ))}
 
-            {/* =================================================
-                INFORMATION PANEL
-               ================================================= */}
-
-            {arPoints.length > 0 && (
-
-              <View
-                pointerEvents="none"
-                style={
-                  styles.arPointsBox
-                }
+          {/* Top Status Pill Overlay + Diagnostic Toggle */}
+          <View style={styles.arTopOverlay} pointerEvents="box-none">
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <View style={styles.topStatusPill}>
+                <Text style={styles.topStatusText}>{getARInstruction()}</Text>
+              </View>
+              <TouchableOpacity
+                style={{ backgroundColor: showDiag ? '#10b981' : 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 16, borderHeight: 1, borderColor: '#334155' }}
+                onPress={() => setShowDiag(prev => !prev)}
               >
+                <Text style={{ color: '#FFFFFF', fontSize: 11, fontWeight: '700' }}>DIAG</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
 
-                <Text
-                  style={
-                    styles.arPointsTitle
-                  }
-                >
-                  Measurement Points
-                </Text>
+          {/* Development Diagnostic Overlay HUD (Requirement 19) */}
+          {showDiag && arDiagnostics && (
+            <View style={styles.diagContainer} pointerEvents="none">
+              <Text style={styles.diagTitle}>⚙ AR DIAGNOSTIC MODE</Text>
+              <Text style={styles.diagLine}>Reticle: ({arDiagnostics.reticleX?.toFixed(0)}, {arDiagnostics.reticleY?.toFixed(0)}) | Viewport: {arDiagnostics.viewportW}x{arDiagnostics.viewportH} | Rot: {arDiagnostics.rotation}</Text>
+              <Text style={styles.diagLine}>Tracking: {trackingQuality} | CandValid: {candidateValid ? 'YES' : 'NO'}</Text>
+              <Text style={styles.diagLine}>Candidate World: X={arDiagnostics.candidateX?.toFixed(3)} Y={arDiagnostics.candidateY?.toFixed(3)} Z={arDiagnostics.candidateZ?.toFixed(3)}</Text>
+              <Text style={styles.diagLine}>P1 Locked: {arDiagnostics.p1 ? `${arDiagnostics.p1[0].toFixed(3)}, ${arDiagnostics.p1[1].toFixed(3)}, ${arDiagnostics.p1[2].toFixed(3)}` : 'NONE'}</Text>
+              <Text style={styles.diagLine}>P2 Locked: {arDiagnostics.p2 ? `${arDiagnostics.p2[0].toFixed(3)}, ${arDiagnostics.p2[1].toFixed(3)}, ${arDiagnostics.p2[2].toFixed(3)}` : 'NONE'}</Text>
+              <Text style={styles.diagLine}>P3 Locked: {arDiagnostics.p3 ? `${arDiagnostics.p3[0].toFixed(3)}, ${arDiagnostics.p3[1].toFixed(3)}, ${arDiagnostics.p3[2].toFixed(3)}` : 'NONE'}</Text>
+              <Text style={styles.diagLine}>P4 Locked: {arDiagnostics.p4 ? `${arDiagnostics.p4[0].toFixed(3)}, ${arDiagnostics.p4[1].toFixed(3)}, ${arDiagnostics.p4[2].toFixed(3)}` : 'NONE'}</Text>
+            </View>
+          )}
 
-                {arPoints.map((p, idx) => (
-                  <Text
-                    key={idx}
-                    style={styles.arPointText}
-                  >
-                    P{idx + 1}: ({p.x.toFixed(3)}, {p.y.toFixed(3)}, {p.z.toFixed(3)})
-                  </Text>
-                ))}
-
-                {arLength !== null && (
-                  <View style={{ marginTop: 6 }}>
-                    <Text style={styles.arPointText}>Length:  {arLength.toFixed(2)} m</Text>
-                    <Text style={styles.arPointText}>Breadth: {arBreadth.toFixed(2)} m</Text>
-                    <Text style={styles.arPointText}>Height:  {arHeight.toFixed(2)} m</Text>
-                    <Text style={[styles.arDistanceLarge, { fontSize: 16 }]}>
-                      Volume: {arVolume} m³
-                    </Text>
+          {/* Bottom Controls Bar (iPhone Measure UI) */}
+          <View style={styles.arBottomBar} pointerEvents="box-none">
+            {/* Validated Summary Card + Analyze Block CTA (when points === 4) */}
+            {arPoints.length === 4 && arLength !== null && (
+              <View style={styles.validatedSummaryCard}>
+                <View style={styles.validatedHeader}>
+                  <Text style={styles.validatedBadge}>✓ Measurement Validated</Text>
+                </View>
+                <View style={styles.validatedGrid}>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Length</Text>
+                    <Text style={styles.valValue}>{arLength.toFixed(2)} m</Text>
                   </View>
-                )}
-
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Height</Text>
+                    <Text style={styles.valValue}>{arHeight.toFixed(2)} m</Text>
+                  </View>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Breadth</Text>
+                    <Text style={styles.valValue}>{arBreadth.toFixed(2)} m</Text>
+                  </View>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Volume</Text>
+                    <Text style={styles.valValueHighlight}>{arVolume} m³</Text>
+                  </View>
+                </View>
+                <TouchableOpacity
+                  style={styles.analyzeCtaBtn}
+                  onPress={() => setScreen('new-inspection')}
+                >
+                  <Text style={styles.analyzeCtaText}>✓ USE THESE MEASUREMENTS</Text>
+                </TouchableOpacity>
               </View>
             )}
 
-            {/* =================================================
-                BUTTONS
-               ================================================= */}
+            {/* Bottom Row Controls */}
+            <View style={styles.arBottomRow}>
+              {/* Reset / Undo Button (Left) */}
+              <TouchableOpacity
+                style={styles.arCircleBtn}
+                onPress={resetAR}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.arCircleBtnIcon}>↺</Text>
+              </TouchableOpacity>
 
-            <View>
-
-              {/* Use measurements button — only when all 4 points done */}
-              {arLength !== null && (
+              {/* Action "+" Button (Center - when points < 4) */}
+              {arPoints.length < 4 && (
                 <TouchableOpacity
                   style={[
-                    styles.arResetButton,
-                    { backgroundColor: '#16a34a', marginBottom: 8 }
+                    styles.arPlusBtn,
+                    { backgroundColor: candidateValid ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)' }
                   ]}
                   onPress={() => {
-                    setScreen('new-inspection');
+                    setTapToken(prev => prev + 1);
                   }}
+                  activeOpacity={0.7}
                 >
-                  <Text style={styles.btnText}>
-                    ✓ USE THESE MEASUREMENTS
-                  </Text>
+                  <View style={styles.arPlusIconInner}>
+                    <Text style={styles.arPlusText}>+</Text>
+                  </View>
                 </TouchableOpacity>
               )}
 
+              {/* Back Button (Right) */}
               <TouchableOpacity
-                style={
-                  styles.arResetButton
-                }
-                onPress={resetAR}
+                style={styles.arCircleBtn}
+                onPress={() => setScreen('new-inspection')}
+                activeOpacity={0.7}
               >
-
-                <Text
-                  style={
-                    styles.btnText
-                  }
-                >
-                  RESET MEASUREMENT
-                </Text>
-
+                <Text style={{ color: '#FFFFFF', fontSize: 18, fontWeight: '600' }}>←</Text>
               </TouchableOpacity>
-
-              <TouchableOpacity
-                style={
-                  styles.arBackButton
-                }
-                onPress={() => {
-                  setScreen('new-inspection');
-                }}
-              >
-
-                <Text
-                  style={
-                    styles.btnText
-                  }
-                >
-                  ← BACK TO INSPECTION FORM
-                </Text>
-
-              </TouchableOpacity>
-
             </View>
 
+            {/* Bottom Mode Selector */}
+            <View style={styles.bottomModeSelector}>
+              <View style={styles.modeTabActive}>
+                <Text style={styles.modeTabActiveText}>Measure</Text>
+              </View>
+              <View style={styles.modeTabInactive}>
+                <Text style={styles.modeTabInactiveText}>Level</Text>
+              </View>
+            </View>
           </View>
-
         </View>
       )}
 
@@ -3250,115 +3321,236 @@ const styles =
         20,
     },
 
-    arTitle: {
-      color:
-        'white',
-      fontSize: 20,
-      fontWeight:
-        'bold',
-      textAlign:
-        'center',
-      backgroundColor:
-        'rgba(0,0,0,0.70)',
-      padding: 10,
-      borderRadius: 8,
-    },
+    // -------------------------------------------------------
+    // iPhone Measure AR Styles
+    // -------------------------------------------------------
 
-    arStatus: {
-      color:
-        'white',
-      fontSize: 14,
-      fontWeight:
-        'bold',
-      textAlign:
-        'center',
-      backgroundColor:
-        'rgba(0,0,0,0.65)',
-      padding: 8,
-      borderRadius: 6,
-      marginTop: 8,
+    arContainer: {
+      flex: 1,
+      backgroundColor: '#000000',
     },
-
-    arInstruction: {
-      color:
-        'white',
+    arView: {
+      ...StyleSheet.absoluteFillObject,
+    },
+    reticleContainer: {
+      ...StyleSheet.absoluteFillObject,
+      justifyContent: 'center',
+      alignItems: 'center',
+      zIndex: 10,
+    },
+    reticleRing: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      borderWidth: 2,
+      justifyContent: 'center',
+      alignItems: 'center',
+      backgroundColor: 'rgba(0, 0, 0, 0.1)',
+    },
+    reticleDot: {
+      width: 6,
+      height: 6,
+      borderRadius: 3,
+    },
+    floatingDistanceBadge: {
+      position: 'absolute',
+      backgroundColor: '#FFFFFF',
+      borderRadius: 14,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+      shadowColor: '#000000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.3,
+      shadowRadius: 4,
+      elevation: 5,
+      zIndex: 15,
+    },
+    floatingDistanceText: {
+      color: '#000000',
+      fontWeight: '700',
       fontSize: 13,
-      textAlign:
-        'center',
-      backgroundColor:
-        'rgba(0,0,0,0.55)',
-      padding: 8,
-      borderRadius: 6,
-      marginTop: 8,
+      letterSpacing: -0.2,
     },
-
-    // -------------------------------------------------------
-    // Measurement information
-    // -------------------------------------------------------
-
-    arPointsBox: {
-      backgroundColor:
-        'rgba(0,0,0,0.75)',
-      padding: 14,
-      borderRadius: 10,
-      borderWidth:
-        1,
-      borderColor:
-        'rgba(255,255,255,0.25)',
+    arTopOverlay: {
+      position: 'absolute',
+      top: 48,
+      left: 0,
+      right: 0,
+      alignItems: 'center',
+      zIndex: 20,
     },
-
-    arPointsTitle: {
-      color:
-        'white',
+    topStatusPill: {
+      backgroundColor: 'rgba(28, 28, 30, 0.75)',
+      paddingHorizontal: 16,
+      paddingVertical: 8,
+      borderRadius: 20,
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.2)',
+    },
+    topStatusText: {
+      color: '#FFFFFF',
+      fontSize: 14,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    arBottomBar: {
+      position: 'absolute',
+      bottom: 24,
+      left: 0,
+      right: 0,
+      alignItems: 'center',
+      zIndex: 20,
+      paddingHorizontal: 20,
+    },
+    arBottomRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      width: '100%',
+      marginBottom: 16,
+    },
+    arCircleBtn: {
+      width: 50,
+      height: 50,
+      borderRadius: 25,
+      backgroundColor: 'rgba(35, 35, 38, 0.8)',
+      justifyContent: 'center',
+      alignItems: 'center',
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.25)',
+    },
+    arCircleBtnIcon: {
+      color: '#FFFFFF',
+      fontSize: 22,
+      fontWeight: '600',
+    },
+    arPlusBtn: {
+      width: 68,
+      height: 68,
+      borderRadius: 34,
+      borderWidth: 3.5,
+      borderColor: '#FFFFFF',
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    arPlusIconInner: {
+      width: 54,
+      height: 54,
+      borderRadius: 27,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    arPlusText: {
+      color: '#FFFFFF',
+      fontSize: 38,
+      fontWeight: '300',
+      marginTop: -2,
+    },
+    bottomModeSelector: {
+      flexDirection: 'row',
+      backgroundColor: 'rgba(35, 35, 38, 0.85)',
+      borderRadius: 20,
+      padding: 3,
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.2)',
+    },
+    modeTabActive: {
+      backgroundColor: 'rgba(255, 255, 255, 0.25)',
+      paddingHorizontal: 18,
+      paddingVertical: 5,
+      borderRadius: 17,
+    },
+    modeTabActiveText: {
+      color: '#FFFFFF',
+      fontSize: 13,
+      fontWeight: '600',
+    },
+    modeTabInactive: {
+      paddingHorizontal: 18,
+      paddingVertical: 5,
+      borderRadius: 17,
+    },
+    modeTabInactiveText: {
+      color: 'rgba(255, 255, 255, 0.5)',
+      fontSize: 13,
+      fontWeight: '500',
+    },
+    validatedSummaryCard: {
+      width: '100%',
+      backgroundColor: 'rgba(28, 28, 30, 0.92)',
+      borderRadius: 16,
+      padding: 16,
+      marginBottom: 16,
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.2)',
+    },
+    validatedHeader: {
+      alignItems: 'center',
+      marginBottom: 12,
+    },
+    validatedBadge: {
+      color: '#22c55e',
       fontSize: 16,
-      fontWeight:
-        'bold',
-      textAlign:
-        'center',
-      marginBottom: 6,
+      fontWeight: '700',
     },
-
-    arPointText: {
-      color:
-        '#bfdbfe',
-      fontSize: 12,
-      marginTop: 3,
-      textAlign:
-        'center',
+    validatedGrid: {
+      flexDirection: 'row',
+      justifyContent: 'space-around',
+      marginBottom: 14,
     },
-
-    arDistanceLarge: {
-      color:
-        'white',
-      fontSize: 32,
-      fontWeight:
-        'bold',
-      textAlign:
-        'center',
-      marginTop: 10,
+    valCell: {
+      alignItems: 'center',
     },
-
-    // -------------------------------------------------------
-    // AR buttons
-    // -------------------------------------------------------
-
-    arResetButton: {
-      backgroundColor:
-        '#f59e0b',
-      padding: 14,
-      borderRadius: 8,
-      alignItems:
-        'center',
-      marginBottom: 10,
+    valLabel: {
+      color: 'rgba(255, 255, 255, 0.6)',
+      fontSize: 11,
+      textTransform: 'uppercase',
+      marginBottom: 2,
     },
-
-    arBackButton: {
-      backgroundColor:
-        '#dc2626',
-      padding: 14,
-      borderRadius: 8,
-      alignItems:
-        'center',
+    valValue: {
+      color: '#FFFFFF',
+      fontSize: 14,
+      fontWeight: '600',
     },
-
+    valValueHighlight: {
+      color: '#38bdf8',
+      fontSize: 15,
+      fontWeight: '700',
+    },
+    analyzeCtaBtn: {
+      backgroundColor: '#16a34a',
+      borderRadius: 12,
+      paddingVertical: 12,
+      alignItems: 'center',
+    },
+    analyzeCtaText: {
+      color: '#FFFFFF',
+      fontSize: 15,
+      fontWeight: '700',
+      letterSpacing: 0.5,
+    },
+    diagContainer: {
+      position: 'absolute',
+      top: 100,
+      left: 12,
+      right: 12,
+      backgroundColor: 'rgba(15, 23, 42, 0.92)',
+      borderRadius: 10,
+      padding: 10,
+      borderWidth: 1,
+      borderColor: '#10b981',
+      zIndex: 100,
+    },
+    diagTitle: {
+      color: '#10b981',
+      fontSize: 11,
+      fontWeight: '700',
+      marginBottom: 4,
+    },
+    diagLine: {
+      color: '#cbd5e1',
+      fontSize: 10,
+      fontFamily: 'monospace',
+      lineHeight: 14,
+    },
   });

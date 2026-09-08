@@ -6,14 +6,7 @@ export type ARStatusEvent = {
 };
 
 export type ARPointSelectedEvent = {
-  screenX: number;
-  screenY: number;
-
-  // Android native view size in physical pixels
-  viewWidth: number;
-  viewHeight: number;
-
-  // ARCore 3D world coordinates
+  // ARCore 3D world coordinates (world-locked anchor position)
   x: number;
   y: number;
   z: number;
@@ -21,8 +14,27 @@ export type ARPointSelectedEvent = {
   trackable: string;
 };
 
+export type AROverlayItem = {
+  id: string;
+  text: string;
+  distance: number;
+  screenX: number;
+  screenY: number;
+  visible: boolean;
+};
+
+export type AROverlayUpdateEvent = {
+  trackingQuality: string;
+  candidateValid: boolean;
+  candidateScreenX: number;
+  candidateScreenY: number;
+  labels: AROverlayItem[];
+};
+
 export type GraniteARViewProps = {
   style?: StyleProp<ViewStyle>;
+  tapToken?: number;
+  resetToken?: number;
 
   onStatus?: (event: {
     nativeEvent: ARStatusEvent;
@@ -30,5 +42,9 @@ export type GraniteARViewProps = {
 
   onPointSelected?: (event: {
     nativeEvent: ARPointSelectedEvent;
+  }) => void;
+
+  onOverlayUpdate?: (event: {
+    nativeEvent: AROverlayUpdateEvent;
   }) => void;
 };

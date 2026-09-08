@@ -7,7 +7,6 @@ import android.graphics.Color
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.view.MotionEvent
 import android.view.Surface
 import android.view.ViewGroup
 
@@ -20,7 +19,7 @@ import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
 import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
-import com.google.ar.core.Point
+import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
@@ -38,11 +37,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.sin
 import kotlin.math.sqrt
-import kotlin.math.PI
-
 
 class GraniteARView(
   context: Context,
@@ -55,6 +50,7 @@ class GraniteARView(
 
   private val onStatus by EventDispatcher()
   private val onPointSelected by EventDispatcher()
+  private val onOverlayUpdate by EventDispatcher()
 
   // ============================================================
   // AR SESSION
@@ -73,16 +69,9 @@ class GraniteARView(
   @Volatile
   private var latestFrame: Frame? = null
 
-  // A tap is processed on the exact ARCore frame that arrives next.
-  // This avoids hit-testing stale frames and prevents missed P3/P4 taps.
+  // Set from UI thread, consumed on GL thread
   @Volatile
   private var pendingTap = false
-
-  @Volatile
-  private var pendingTapX = 0f
-
-  @Volatile
-  private var pendingTapY = 0f
 
   // ============================================================
   // DISPLAY GEOMETRY
@@ -95,39 +84,48 @@ class GraniteARView(
   private var displayHeight = 1
 
   @Volatile
-  private var displayRotation =
-    Surface.ROTATION_0
+  private var displayRotation = Surface.ROTATION_0
 
   // ============================================================
   // MEASUREMENT ANCHORS
   // ============================================================
 
+  /**
+   * Holds one confirmed measurement point.
+   *
+   * [anchor]        : ARCore surface-attached anchor created ONLY via
+   *                   HitResult.createAnchor() — NEVER via Session.createAnchor(freePose)
+   *                   which creates a free-floating anchor that drifts.
+   * [number]        : 1-based index (P1..P4).
+   * [lastKnownPose] : Last valid pose snapshot — used when anchor is PAUSED so the
+   *                   point stays visible instead of disappearing temporarily.
+   */
   private data class MeasurementAnchor(
-    val anchor: Anchor,
-    val number: Int
+    val anchor: Anchor?,
+    val number: Int,
+    val lockedPose: Pose
   )
 
-  private data class ProjectedPoint(
-    val x: Float,
-    val y: Float,
-    val number: Int
-  )
+  private val measurementAnchors = mutableListOf<MeasurementAnchor>()
 
-  private val measurementAnchors =
-    mutableListOf<MeasurementAnchor>()
+  /**
+   * Frozen world positions captured once P4 is confirmed.
+   * Never recomputed from live anchor poses — used for final measurement and photo.
+   */
+  private var frozenPositions: List<FloatArray>? = null
 
   // ============================================================
-  // LIVE PREVIEW
+  // CANDIDATE STATE (written/read on GL thread only)
   // ============================================================
 
   @Volatile
-  private var previewActive = false
+  private var candidateValid = false
 
   @Volatile
-  private var previewX = 0f
+  private var candidatePose: Pose? = null
 
-  @Volatile
-  private var previewY = 0f
+  // Throttle overlay updates to ~30 fps
+  private var lastOverlayEmitTime = 0L
 
   // ============================================================
   // CAMERA BACKGROUND TEXTURE
@@ -140,13 +138,9 @@ class GraniteARView(
   // ============================================================
 
   init {
-
     setBackgroundColor(Color.BLACK)
-
     isClickable = true
-
     setupGLSurfaceView()
-
     createSession()
   }
 
@@ -155,32 +149,17 @@ class GraniteARView(
   // ============================================================
 
   private fun setupGLSurfaceView() {
-
-    glSurfaceView =
-      GLSurfaceView(context)
-
+    glSurfaceView = GLSurfaceView(context)
     glSurfaceView.setEGLContextClientVersion(2)
-
     glSurfaceView.preserveEGLContextOnPause = true
 
-    renderer =
-      ARRenderer()
-
+    renderer = ARRenderer()
     glSurfaceView.setRenderer(renderer)
+    glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
-    glSurfaceView.renderMode =
-      GLSurfaceView.RENDERMODE_CONTINUOUSLY
-
-    // ----------------------------------------------------------
-    // Touch events
-    // ----------------------------------------------------------
-
-    glSurfaceView.setOnTouchListener { _, event ->
-
-      handleTouch(event)
-
-      true
-    }
+    // Touch events are consumed but NOT used for AR point placement.
+    // All AR hit-testing uses the screen center exclusively.
+    glSurfaceView.setOnTouchListener { _, _ -> true }
 
     addView(
       glSurfaceView,
@@ -192,96 +171,12 @@ class GraniteARView(
   }
 
   // ============================================================
-  // TOUCH HANDLING
+  // CENTER-RETICLE TAP  (called from React Native via module prop)
   // ============================================================
 
-  private fun handleTouch(
-    event: MotionEvent
-  ) {
-
-    when (event.actionMasked) {
-
-      // --------------------------------------------------------
-      // START
-      // --------------------------------------------------------
-
-      MotionEvent.ACTION_DOWN -> {
-
-        previewActive = true
-
-        previewX =
-          event.x
-
-        previewY =
-          event.y
-
-        renderer.setPreview(
-          true,
-          event.x,
-          event.y
-        )
-
-        postStatus(
-          "POINT_PREVIEW",
-          "Move to a corner and release"
-        )
-      }
-
-      // --------------------------------------------------------
-      // DRAG
-      // --------------------------------------------------------
-
-      MotionEvent.ACTION_MOVE -> {
-
-        previewX =
-          event.x
-
-        previewY =
-          event.y
-
-        renderer.setPreview(
-          true,
-          event.x,
-          event.y
-        )
-      }
-
-      // --------------------------------------------------------
-      // RELEASE
-      // --------------------------------------------------------
-
-      MotionEvent.ACTION_UP -> {
-
-        previewActive = false
-
-        renderer.setPreview(
-          false,
-          event.x,
-          event.y
-        )
-
-        // Store the tap. It is consumed by onDrawFrame() on the next
-        // current ARCore frame, so hit testing never uses a stale frame.
-        pendingTapX = event.x
-        pendingTapY = event.y
-        pendingTap = true
-      }
-
-      // --------------------------------------------------------
-      // CANCEL
-      // --------------------------------------------------------
-
-      MotionEvent.ACTION_CANCEL -> {
-
-        previewActive = false
-
-        renderer.setPreview(
-          false,
-          0f,
-          0f
-        )
-      }
-    }
+  /** Triggers point placement at screen center on the next GL frame. */
+  fun triggerCenterTap() {
+    pendingTap = true
   }
 
   // ============================================================
@@ -289,447 +184,265 @@ class GraniteARView(
   // ============================================================
 
   private fun createSession() {
-
-    val activity =
-      appContext.currentActivity
-
+    val activity = appContext.currentActivity
     if (activity == null) {
-
-      postStatus(
-        "ERROR",
-        "No active Android Activity"
-      )
-
+      postStatus("ERROR", "No active Android Activity")
       return
     }
 
     try {
-
-      // --------------------------------------------------------
-      // CAMERA PERMISSION
-      // --------------------------------------------------------
-
       if (
         ActivityCompat.checkSelfPermission(
           activity,
           Manifest.permission.CAMERA
         ) != PackageManager.PERMISSION_GRANTED
       ) {
-
         ActivityCompat.requestPermissions(
           activity,
           arrayOf(Manifest.permission.CAMERA),
           1001
         )
-
-        postStatus(
-          "CAMERA_PERMISSION",
-          "Camera permission requested"
-        )
-
+        postStatus("CAMERA_PERMISSION", "Camera permission requested")
         return
       }
 
-      // --------------------------------------------------------
-      // ARCORE SUPPORT
-      // --------------------------------------------------------
-
-      val availability =
-        ArCoreApk.getInstance()
-          .checkAvailability(activity)
-
+      val availability = ArCoreApk.getInstance().checkAvailability(activity)
       if (!availability.isSupported) {
-
-        postStatus(
-          "AR_NOT_SUPPORTED",
-          "This device does not support ARCore"
-        )
-
+        postStatus("AR_NOT_SUPPORTED", "This device does not support ARCore")
         return
       }
-
-      // --------------------------------------------------------
-      // INSTALL ARCORE
-      // --------------------------------------------------------
 
       try {
-
-        ArCoreApk.getInstance()
-          .requestInstall(
-            activity,
-            true
-          )
-
-      } catch (
-        _: UnavailableArcoreNotInstalledException
-      ) {
-
-        postStatus(
-          "ARCORE_INSTALL",
-          "Google Play Services for AR is not installed"
-        )
-
+        ArCoreApk.getInstance().requestInstall(activity, true)
+      } catch (_: UnavailableArcoreNotInstalledException) {
+        postStatus("ARCORE_INSTALL", "Google Play Services for AR is not installed")
         return
-
-      } catch (
-        _: UnavailableUserDeclinedInstallationException
-      ) {
-
-        postStatus(
-          "ARCORE_INSTALL_DECLINED",
-          "ARCore installation was declined"
-        )
-
+      } catch (_: UnavailableUserDeclinedInstallationException) {
+        postStatus("ARCORE_INSTALL_DECLINED", "ARCore installation was declined")
         return
       }
 
-      // --------------------------------------------------------
-      // CREATE SESSION
-      // --------------------------------------------------------
-
-      session =
-        Session(activity)
-
+      session = Session(activity)
       configureSession()
-
-      postStatus(
-        "READY",
-        "ARCore session created"
-      )
-
+      postStatus("READY", "ARCore session created")
       startPreview()
 
-    } catch (
-      _: UnavailableDeviceNotCompatibleException
-    ) {
-
-      postStatus(
-        "AR_ERROR",
-        "Device is not ARCore compatible"
-      )
-
-    } catch (
-      _: UnavailableSdkTooOldException
-    ) {
-
-      postStatus(
-        "AR_ERROR",
-        "ARCore SDK is too old"
-      )
-
-    } catch (
-      _: UnavailableApkTooOldException
-    ) {
-
-      postStatus(
-        "AR_ERROR",
-        "ARCore APK is too old"
-      )
-
+    } catch (_: UnavailableDeviceNotCompatibleException) {
+      postStatus("AR_ERROR", "Device is not ARCore compatible")
+    } catch (_: UnavailableSdkTooOldException) {
+      postStatus("AR_ERROR", "ARCore SDK is too old")
+    } catch (_: UnavailableApkTooOldException) {
+      postStatus("AR_ERROR", "ARCore APK is too old")
     } catch (e: Exception) {
-
-      postStatus(
-        "AR_ERROR",
-        e.message ?: "Failed to create AR session"
-      )
+      postStatus("AR_ERROR", e.message ?: "Failed to create AR session")
     }
   }
 
-  // ============================================================
-  // CONFIGURE SESSION
-  // ============================================================
-
   private fun configureSession() {
+    val currentSession = session ?: return
+    val config = Config(currentSession)
+    config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+    config.updateMode = Config.UpdateMode.BLOCKING
+    config.focusMode = Config.FocusMode.AUTO
 
-    val currentSession =
-      session ?: return
-
-    val config =
-      Config(currentSession)
-
-    config.planeFindingMode =
-      Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-
-    config.updateMode =
-      Config.UpdateMode.BLOCKING
-
-    config.focusMode =
-      Config.FocusMode.AUTO
-
-    if (
-      currentSession.isDepthModeSupported(
-        Config.DepthMode.AUTOMATIC
-      )
-    ) {
-
-      config.depthMode =
-        Config.DepthMode.AUTOMATIC
+    if (currentSession.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+      config.depthMode = Config.DepthMode.AUTOMATIC
     }
-
     currentSession.configure(config)
   }
 
-  // ============================================================
-  // APPLY DISPLAY GEOMETRY
-  // ============================================================
-
-  private fun updateDisplayGeometry(
-    width: Int,
-    height: Int
-  ) {
-
-    if (width <= 0 || height <= 0) {
-      return
-    }
-
+  private fun updateDisplayGeometry(width: Int, height: Int) {
+    if (width <= 0 || height <= 0) return
     displayWidth = width
     displayHeight = height
-
-    val rotation =
-      glSurfaceView.display?.rotation
-        ?: Surface.ROTATION_0
-
-    displayRotation =
-      rotation
+    val rotation = glSurfaceView.display?.rotation ?: Surface.ROTATION_0
+    displayRotation = rotation
 
     try {
-
-      session?.setDisplayGeometry(
-        rotation,
-        width,
-        height
-      )
-
-    } catch (_: Exception) {
-    }
+      session?.setDisplayGeometry(rotation, width, height)
+    } catch (_: Exception) {}
   }
-
-  // ============================================================
-  // START AR
-  // ============================================================
 
   private fun startPreview() {
-
-    val currentSession =
-      session ?: return
-
+    val currentSession = session ?: return
     try {
-
-      updateDisplayGeometry(
-        displayWidth,
-        displayHeight
-      )
-
+      updateDisplayGeometry(displayWidth, displayHeight)
       currentSession.resume()
-
       sessionRunning = true
-
       glSurfaceView.onResume()
-
-      postStatus(
-        "TRACKING",
-        "AR tracking started"
-      )
-
-    } catch (
-      _: CameraNotAvailableException
-    ) {
-
+      postStatus("TRACKING", "AR tracking started")
+    } catch (_: CameraNotAvailableException) {
       sessionRunning = false
-
-      postStatus(
-        "CAMERA_ERROR",
-        "Camera is not available"
-      )
+      postStatus("CAMERA_ERROR", "Camera is not available")
     }
   }
 
-  // ============================================================
-  // SURFACE SIZE / ORIENTATION
-  // ============================================================
-
-  override fun onSizeChanged(
-    width: Int,
-    height: Int,
-    oldWidth: Int,
-    oldHeight: Int
-  ) {
-
-    super.onSizeChanged(
-      width,
-      height,
-      oldWidth,
-      oldHeight
-    )
-
-    displayWidth = width
-    displayHeight = height
-
-    glSurfaceView.post {
-
-      updateDisplayGeometry(
-        width,
-        height
-      )
-    }
+  override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+    super.onSizeChanged(w, h, oldw, oldh)
+    displayWidth = w
+    displayHeight = h
+    glSurfaceView.post { updateDisplayGeometry(w, h) }
   }
-
-  // ============================================================
-  // ATTACHED
-  // ============================================================
 
   override fun onAttachedToWindow() {
-
     super.onAttachedToWindow()
-
     if (session == null) {
-
       createSession()
-
     } else if (!sessionRunning) {
-
       try {
-
-        updateDisplayGeometry(
-          width,
-          height
-        )
-
+        updateDisplayGeometry(width, height)
         session?.resume()
-
         sessionRunning = true
-
         glSurfaceView.onResume()
-
-      } catch (_: Exception) {
-      }
+      } catch (_: Exception) {}
     }
   }
 
-  // ============================================================
-  // DETACHED
-  // ============================================================
-
   override fun onDetachedFromWindow() {
-
     glSurfaceView.onPause()
-
-    try {
-      session?.pause()
-    } catch (_: Exception) {
-    }
-
+    try { session?.pause() } catch (_: Exception) {}
     sessionRunning = false
-
     latestFrame = null
-
     super.onDetachedFromWindow()
   }
 
   // ============================================================
-  // PROCESS TAP ON THE CURRENT ARCORE FRAME
+  // PROCESS TAP — always hits against screen CENTER
   // ============================================================
 
+  /**
+   * Called on the GL thread from onDrawFrame.
+   *
+   * KEY: hitTest coordinates are always (displayWidth/2, displayHeight/2).
+   * Synchronizes with the candidatePose validated in the current frame.
+   */
   private fun processPendingTap(frame: Frame) {
-
-    if (!pendingTap) {
-      return
-    }
-
-    if (frame.camera.trackingState != TrackingState.TRACKING) {
-      return
-    }
-
-    val tapX = pendingTapX
-    val tapY = pendingTapY
-
-    // Consume exactly one tap.
+    if (!pendingTap) return
     pendingTap = false
 
+    if (frame.camera.trackingState != TrackingState.TRACKING) {
+      postStatus("NO_HIT", "Move phone slowly to scan the block surface first.")
+      return
+    }
+
+    if (measurementAnchors.size >= 4) {
+      postStatus("COMPLETE", "All 4 points placed. Press Reset to start over.")
+      return
+    }
+
+    val currentCand = candidatePose
+    if (!candidateValid || currentCand == null) {
+      postStatus("NO_HIT", "Unable to find a stable surface here. Aim target at a granite corner and try again.")
+      return
+    }
+
     try {
+      val finalPose = currentCand
+      val pointNumber = measurementAnchors.size + 1
 
-      val hits = frame.hitTest(tapX, tapY)
-
-      if (hits.isEmpty()) {
-        postStatus(
-          "NO_HIT",
-          "No real-world surface found at that location"
-        )
-        return
-      }
-
-      // IMPORTANT:
-      // Prefer a tracked PLANE before feature/depth points.
-      // DepthPoint values can fluctuate on object edges, while a tracked
-      // plane gives a much more stable world position for a corner on a flat face.
-      var selectedHit: HitResult? = null
-
-      // 1. Nearest valid plane hit.
-      for (hit in hits) {
-        val trackable = hit.trackable
-
-        if (
-          trackable is Plane &&
-          trackable.trackingState == TrackingState.TRACKING &&
-          trackable.isPoseInExtents(hit.hitPose)
-        ) {
-          selectedHit = hit
-          break
+      // Geometric validation for P4
+      if (pointNumber == 4) {
+        val msg = validateP4(finalPose)
+        if (msg != null) {
+          postStatus("POINT_REJECTED", msg)
+          return
         }
       }
 
-      if (selectedHit == null) {
-        postStatus(
-          "NO_HIT",
-          "No tracked surface found"
-        )
-        return
-      }
+      val hits = frame.hitTest(displayWidth / 2.0f, displayHeight / 2.0f)
+      val selectedHit = selectBestHit(hits)
+      val anchor: Anchor? = try {
+        selectedHit?.createAnchor()
+      } catch (_: Exception) { null }
 
-      // Never create a fifth point. The UI must reset before another measurement.
-      if (measurementAnchors.size >= 4) {
-        postStatus(
-          "COMPLETE",
-          "P1-P4 already selected. Press Reset Measurement."
-        )
-        return
-      }
-
-      val anchor = selectedHit.createAnchor()
-      val pointNumber = measurementAnchors.size + 1
-
+      // CRITICAL: Lock 3D coordinates at confirmation time (immutable lockedPose)
       measurementAnchors.add(
         MeasurementAnchor(
           anchor = anchor,
-          number = pointNumber
+          number = pointNumber,
+          lockedPose = finalPose
         )
       )
 
-      // Send the anchored world position to React Native.
-      val pose = anchor.pose
+      // Log immutable point registration
+      android.util.Log.i("AR-CONFIRM", "P$pointNumber locked at world=(${finalPose.tx()}, ${finalPose.ty()}, ${finalPose.tz()})")
+
+      // Freeze positions once all 4 points are confirmed
+      if (pointNumber == 4) {
+        frozenPositions = measurementAnchors.map { m ->
+          val p = getAnchorPose(m)
+          floatArrayOf(p.tx(), p.ty(), p.tz())
+        }
+      }
 
       postPointSelected(
-        tapX,
-        tapY,
-        pose.tx(),
-        pose.ty(),
-        pose.tz(),
-        selectedHit.trackable.javaClass.simpleName ?: "Unknown"
+        finalPose.tx(),
+        finalPose.ty(),
+        finalPose.tz(),
+        selectedHit?.trackable?.javaClass?.simpleName ?: "Plane"
       )
 
       when (pointNumber) {
-        1 -> postStatus("POINT_SELECTED", "P1 selected. Select P2.")
-        2 -> postStatus("POINT_SELECTED", "P2 selected. Select P3.")
-        3 -> postStatus("POINT_SELECTED", "P3 selected. Select P4.")
-        4 -> postStatus("MEASUREMENT_COMPLETE", "P1, P2, P3 and P4 selected.")
+        1 -> postStatus("POINT_SELECTED", "P1 locked. Now aim at bottom-front-right corner.")
+        2 -> postStatus("POINT_SELECTED", "P2 locked. Now aim at top-front-right corner.")
+        3 -> postStatus("POINT_SELECTED", "P3 locked. Now aim at top-back-right corner for depth.")
+        4 -> postStatus("MEASUREMENT_COMPLETE", "All 4 corners locked. Block dimensions calculated.")
       }
 
     } catch (e: Exception) {
-      postStatus(
-        "POINT_ERROR",
-        e.message ?: "Unable to create measurement point"
-      )
+      postStatus("POINT_ERROR", e.message ?: "Unable to create measurement point")
     }
+  }
+
+  private fun getAnchorPose(m: MeasurementAnchor): Pose {
+    val a = m.anchor
+    if (a != null && a.trackingState == TrackingState.TRACKING) {
+      return a.pose
+    }
+    return m.lockedPose
+  }
+
+  /**
+   * Selects the physical surface hit closest to the camera along the center reticle ray.
+   * Hits are already ordered by distance along the ray by ARCore.
+   */
+  private fun selectBestHit(hits: List<HitResult>): HitResult? {
+    for (hit in hits) {
+      if (hit.trackable.trackingState == TrackingState.TRACKING && hit.distance in 0.05f..8.0f) {
+        return hit
+      }
+    }
+    return null
+  }
+
+  /** Returns null if P4 is valid, rejection message string if invalid. */
+  private fun validateP4(p4Pose: Pose): String? {
+    val p1 = getAnchorPose(measurementAnchors[0])
+    val p2 = getAnchorPose(measurementAnchors[1])
+    val p3 = getAnchorPose(measurementAnchors[2])
+
+    val v12 = floatArrayOf(p2.tx()-p1.tx(), p2.ty()-p1.ty(), p2.tz()-p1.tz())
+    val v23 = floatArrayOf(p3.tx()-p2.tx(), p3.ty()-p2.ty(), p3.tz()-p2.tz())
+    val v34 = floatArrayOf(p4Pose.tx()-p3.tx(), p4Pose.ty()-p3.ty(), p4Pose.tz()-p3.tz())
+
+    val lenL = sqrt((v12[0]*v12[0]+v12[1]*v12[1]+v12[2]*v12[2]).toDouble()).toFloat()
+    val lenH = sqrt((v23[0]*v23[0]+v23[1]*v23[1]+v23[2]*v23[2]).toDouble()).toFloat()
+    val lenB = sqrt((v34[0]*v34[0]+v34[1]*v34[1]+v34[2]*v34[2]).toDouble()).toFloat()
+
+    if (lenB < 0.05f)
+      return "P4 is too close to P3. Aim at the top-back corner of the block."
+
+    val maxFront = maxOf(lenL, lenH)
+    if (maxFront > 0.01f && lenB > 3.0f * maxFront)
+      return "P4 depth seems too large. Make sure you are aiming at the top-back corner."
+
+    val dot12_34 = if (lenL>0f && lenB>0f) abs(v12[0]*v34[0]+v12[1]*v34[1]+v12[2]*v34[2])/(lenL*lenB) else 0f
+    val dot23_34 = if (lenH>0f && lenB>0f) abs(v23[0]*v34[0]+v23[1]*v34[1]+v23[2]*v34[2])/(lenH*lenB) else 0f
+
+    if (dot12_34 > 0.80f || dot23_34 > 0.80f)
+      return "P4 is nearly parallel to an existing edge. Aim at the top-back corner."
+
+    return null
   }
 
   // ============================================================
@@ -737,77 +450,29 @@ class GraniteARView(
   // ============================================================
 
   fun resetMeasurement() {
-
     glSurfaceView.queueEvent {
-
       for (item in measurementAnchors) {
-
-        try {
-          item.anchor.detach()
-        } catch (_: Exception) {
-        }
+        try { item.anchor?.detach() } catch (_: Exception) {}
       }
-
       measurementAnchors.clear()
-
+      frozenPositions = null
       pendingTap = false
-      pendingTapX = 0f
-      pendingTapY = 0f
-
-      previewActive = false
-
-      renderer.setPreview(
-        false,
-        0f,
-        0f
-      )
-
-      postStatus(
-        "RESET",
-        "Measurement reset"
-      )
+      candidateValid = false
+      candidatePose = null
+      postStatus("RESET", "Measurement reset")
     }
   }
 
-  // ============================================================
-  // STATUS EVENT
-  // ============================================================
-
-  private fun postStatus(
-    status: String,
-    message: String
-  ) {
-
+  private fun postStatus(status: String, message: String) {
     post {
-
-      this@GraniteARView.onStatus(
-        mapOf(
-          "status" to status,
-          "message" to message
-        )
-      )
+      onStatus(mapOf("status" to status, "message" to message))
     }
   }
 
-  // ============================================================
-  // POINT EVENT
-  // ============================================================
-
-  private fun postPointSelected(
-    screenX: Float,
-    screenY: Float,
-    x: Float,
-    y: Float,
-    z: Float,
-    trackable: String
-  ) {
-
+  private fun postPointSelected(x: Float, y: Float, z: Float, trackable: String) {
     post {
-
-      this@GraniteARView.onPointSelected(
+      onPointSelected(
         mapOf(
-          "screenX" to screenX,
-          "screenY" to screenY,
           "x" to x,
           "y" to y,
           "z" to z,
@@ -817,965 +482,534 @@ class GraniteARView(
     }
   }
 
+  private fun postOverlayUpdate(
+    trackingQuality: String,
+    candidateValid: Boolean,
+    candidateScreenX: Float,
+    candidateScreenY: Float,
+    labels: List<Map<String, Any>>,
+    diagnostics: Map<String, Any?> = emptyMap()
+  ) {
+    post {
+      onOverlayUpdate(
+        mapOf(
+          "trackingQuality" to trackingQuality,
+          "candidateValid" to candidateValid,
+          "candidateScreenX" to candidateScreenX,
+          "candidateScreenY" to candidateScreenY,
+          "labels" to labels,
+          "diagnostics" to diagnostics
+        )
+      )
+    }
+  }
+
   // ============================================================
   // OPENGL RENDERER
   // ============================================================
 
-  private inner class ARRenderer :
-    GLSurfaceView.Renderer {
+  private inner class ARRenderer : GLSurfaceView.Renderer {
 
-    // ==========================================================
-    // CAMERA SHADER
-    // ==========================================================
-
+    // Camera Shader
     private var cameraProgram = 0
-
     private var cameraPositionHandle = 0
-
     private var cameraTexCoordHandle = 0
-
     private var cameraTextureHandle = 0
 
-    // ==========================================================
-    // MEASUREMENT SHADER
-    // ==========================================================
+    // Point Shader (iPhone Measure circular white points with soft edge)
+    private var pointProgram = 0
+    private var pointPositionHandle = 0
+    private var pointColorHandle = 0
+    private var pointSizeHandle = 0
+    private var pointViewProjectionHandle = 0
 
-    private var measurementProgram = 0
+    // Line Shader (Thin crisp white lines)
+    private var lineProgram = 0
+    private var linePositionHandle = 0
+    private var lineColorHandle = 0
+    private var lineViewProjectionHandle = 0
 
-    private var measurementPositionHandle = 0
+    // Geometry buffers
+    private val cameraVertices = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+    private val originalTexCoords = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+    private val transformedTexCoords = FloatArray(8)
 
-    private var measurementColorHandle = 0
+    private lateinit var cameraVertexBuffer: FloatBuffer
+    private lateinit var cameraTexCoordBuffer: FloatBuffer
 
-    private var measurementViewProjectionHandle = 0
+    // Matrices
+    private val viewMatrix = FloatArray(16)
+    private val projectionMatrix = FloatArray(16)
+    private val viewProjectionMatrix = FloatArray(16)
 
-    // ==========================================================
-    // CAMERA VERTICES
-    // ==========================================================
 
-    private val cameraVertices =
-      floatArrayOf(
-
-        -1f, -1f,
-
-         1f, -1f,
-
-        -1f,  1f,
-
-         1f,  1f
-      )
-
-    // ==========================================================
-    // CAMERA UV
-    // ==========================================================
-
-    private val originalTexCoords =
-      floatArrayOf(
-
-        0f, 0f,
-
-        1f, 0f,
-
-        0f, 1f,
-
-        1f, 1f
-      )
-
-    private val transformedTexCoords =
-      FloatArray(8)
-
-    // ==========================================================
-    // BUFFERS
-    // ==========================================================
-
-    private lateinit var cameraVertexBuffer:
-      FloatBuffer
-
-    private lateinit var cameraTexCoordBuffer:
-      FloatBuffer
-
-    // ==========================================================
-    // MATRICES
-    // ==========================================================
-
-    private val viewMatrix =
-      FloatArray(16)
-
-    private val projectionMatrix =
-      FloatArray(16)
-
-    private val viewProjectionMatrix =
-      FloatArray(16)
-
-    // ==========================================================
-    // PREVIEW
-    // ==========================================================
-
-    @Volatile
-    private var previewEnabled = false
-
-    @Volatile
-    private var previewScreenX = 0f
-
-    @Volatile
-    private var previewScreenY = 0f
-
-    // ==========================================================
-    // SURFACE CREATED
-    // ==========================================================
-
-    override fun onSurfaceCreated(
-      gl: javax.microedition.khronos.opengles.GL10?,
-      config: javax.microedition.khronos.egl.EGLConfig?
-    ) {
-
-      GLES20.glClearColor(
-        0f,
-        0f,
-        0f,
-        1f
-      )
+    override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
+      GLES20.glClearColor(0f, 0f, 0f, 1f)
 
       setupCameraShader()
+      setupPointShader()
+      setupLineShader()
 
-      setupMeasurementShader()
-
-      cameraVertexBuffer =
-        createFloatBuffer(
-          cameraVertices
-        )
-
-      cameraTexCoordBuffer =
-        createFloatBuffer(
-          originalTexCoords
-        )
-
+      cameraVertexBuffer = createFloatBuffer(cameraVertices)
+      cameraTexCoordBuffer = createFloatBuffer(originalTexCoords)
       setupCameraTexture()
 
-      postStatus(
-        "GL_READY",
-        "Camera renderer ready"
-      )
+      postStatus("GL_READY", "Camera renderer ready")
     }
 
-    // ==========================================================
-    // SURFACE CHANGED
-    // ==========================================================
-
-    override fun onSurfaceChanged(
-      gl: javax.microedition.khronos.opengles.GL10?,
-      width: Int,
-      height: Int
-    ) {
-
-      GLES20.glViewport(
-        0,
-        0,
-        width,
-        height
-      )
-
-      displayWidth =
-        width
-
-      displayHeight =
-        height
-
-      glSurfaceView.post {
-
-        updateDisplayGeometry(
-          width,
-          height
-        )
-      }
+    override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
+      GLES20.glViewport(0, 0, width, height)
+      displayWidth = width
+      displayHeight = height
+      glSurfaceView.post { updateDisplayGeometry(width, height) }
     }
 
-    // ==========================================================
-    // DRAW FRAME
-    // ==========================================================
+    override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
+      GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
-    override fun onDrawFrame(
-      gl: javax.microedition.khronos.opengles.GL10?
-    ) {
-
-      GLES20.glClear(
-        GLES20.GL_COLOR_BUFFER_BIT or
-          GLES20.GL_DEPTH_BUFFER_BIT
-      )
-
-      val currentSession =
-        session ?: return
-
-      if (!sessionRunning) {
-        return
-      }
+      val currentSession = session ?: return
+      if (!sessionRunning) return
 
       try {
+        currentSession.setCameraTextureName(cameraTextureId)
+        val frame = currentSession.update()
+        latestFrame = frame
 
-        // ------------------------------------------------------
-        // Give camera texture to ARCore.
-        // ------------------------------------------------------
-
-        currentSession.setCameraTextureName(
-          cameraTextureId
-        )
-
-        // ------------------------------------------------------
-        // Get ARCore frame.
-        // ------------------------------------------------------
-
-        val frame =
-          currentSession.update()
-
-        /*
-         * Keep the latest frame for touch hit testing.
-         */
-        latestFrame =
-          frame
-
-        // Process any user tap against THIS exact current ARCore frame.
         processPendingTap(frame)
 
-        val camera =
-          frame.camera
+        val camera = frame.camera
+        val trackingState = camera.trackingState
 
-        // ------------------------------------------------------
-        // Camera not tracking yet.
-        // ------------------------------------------------------
-
-        if (
-          camera.trackingState !=
-          TrackingState.TRACKING
-        ) {
-
-          drawCamera(
-            frame
+        if (trackingState != TrackingState.TRACKING) {
+          drawCamera(frame)
+          postOverlayUpdate(
+            trackingQuality = "INSUFFICIENT",
+            candidateValid = false,
+            candidateScreenX = displayWidth / 2f,
+            candidateScreenY = displayHeight / 2f,
+            labels = emptyList()
           )
-
           return
         }
 
-        // ------------------------------------------------------
-        // View matrix
-        // ------------------------------------------------------
+        camera.getViewMatrix(viewMatrix, 0)
+        camera.getProjectionMatrix(projectionMatrix, 0, 0.01f, 100f)
+        android.opengl.Matrix.multiplyMM(viewProjectionMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
 
-        camera.getViewMatrix(
-          viewMatrix,
-          0
-        )
+        // 1. Render camera background
+        drawCamera(frame)
 
-        // ------------------------------------------------------
-        // Projection matrix
-        // ------------------------------------------------------
+        // 2. Continuous candidate hit-test at SCREEN CENTER only (never touch coords)
+        val centerHits = frame.hitTest(displayWidth / 2.0f, displayHeight / 2.0f)
+        val candidateHit = selectBestHit(centerHits)
+        candidateValid = (candidateHit != null)
+        candidatePose = candidateHit?.hitPose
+        val localCandidatePose = candidatePose
 
-        camera.getProjectionMatrix(
-          projectionMatrix,
-          0,
-          0.01f,
-          100f
-        )
-
-        android.opengl.Matrix.multiplyMM(
-          viewProjectionMatrix,
-          0,
-          projectionMatrix,
-          0,
-          viewMatrix,
-          0
-        )
-
-        // ======================================================
-        // 1. CAMERA
-        // ======================================================
-
-        drawCamera(
-          frame
-        )
-
-        // ======================================================
-        // 2. WORLD ANCHORED MEASUREMENTS
-        // ======================================================
-
+        // 4. Draw confirmed world-locked anchors and lines
         drawWorldMeasurements()
 
-        // ======================================================
-        // 3. LIVE PREVIEW
-        // ======================================================
+        // 5. Draw candidate dot & live preview segments (when points < 4 and candidate valid)
+        val confirmedCount = measurementAnchors.size
+        if (confirmedCount < 4 && localCandidatePose != null) {
+          GLES20.glEnable(GLES20.GL_BLEND)
+          GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-        if (previewEnabled) {
+          val candVerts = floatArrayOf(
+            localCandidatePose.tx(), localCandidatePose.ty(), localCandidatePose.tz()
+          )
+          drawPoints3D(candVerts, floatArrayOf(1f, 1f, 1f, 0.85f), 28.0f)
 
-          drawPreview()
+          if (confirmedCount in 1..2) {
+            val lastPose = getAnchorPose(measurementAnchors.last())
+            val lineVerts = floatArrayOf(
+              lastPose.tx(), lastPose.ty(), lastPose.tz(),
+              localCandidatePose.tx(), localCandidatePose.ty(), localCandidatePose.tz()
+            )
+            drawLines3D(lineVerts, floatArrayOf(1f, 1f, 1f, 0.65f), 2.5f)
+          } else if (confirmedCount == 3) {
+            val p3Pose = getAnchorPose(measurementAnchors[2])
+            val p1Pose = getAnchorPose(measurementAnchors[0])
+            val lineVerts = floatArrayOf(
+              p3Pose.tx(), p3Pose.ty(), p3Pose.tz(),
+              localCandidatePose.tx(), localCandidatePose.ty(), localCandidatePose.tz(),
+              localCandidatePose.tx(), localCandidatePose.ty(), localCandidatePose.tz(),
+              p1Pose.tx(), p1Pose.ty(), p1Pose.tz()
+            )
+            drawLines3D(lineVerts, floatArrayOf(1f, 1f, 1f, 0.65f), 2.5f)
+          }
+
+          GLES20.glDisable(GLES20.GL_BLEND)
         }
 
-      } catch (
-        _: CameraNotAvailableException
-      ) {
+        // 6. Emit overlay update
+        val now = System.currentTimeMillis()
+        if (now - lastOverlayEmitTime > 33) {
+          lastOverlayEmitTime = now
+          buildAndEmitOverlay(localCandidatePose)
+        }
 
-        postStatus(
-          "CAMERA_ERROR",
-          "Camera became unavailable"
-        )
-
-      } catch (_: Exception) {
-
-        // Keep renderer alive.
-      }
+      } catch (_: CameraNotAvailableException) {
+        postStatus("CAMERA_ERROR", "Camera became unavailable")
+      } catch (_: Exception) {}
     }
 
     // ==========================================================
-    // CAMERA TEXTURE
+    // BUILD OVERLAY LABELS & SCREEN PROJECTIONS
+    // ==========================================================
+
+    private fun buildAndEmitOverlay(currentCandidate: Pose?) {
+      val labels = mutableListOf<Map<String, Any>>()
+
+      val poses = if (frozenPositions != null) {
+        frozenPositions!!.map { Pose.makeTranslation(it[0], it[1], it[2]) }
+      } else {
+        measurementAnchors.map { getAnchorPose(it) }
+      }
+
+      val formatDist: (Float) -> String = { d ->
+        if (d < 1.0f) "${(d * 100).toInt()} cm" else String.format("%.2f m", d)
+      }
+
+      fun maybeAddLabel(pA: Pose, pB: Pose, id: String) {
+        val mx = (pA.tx() + pB.tx()) / 2f
+        val my = (pA.ty() + pB.ty()) / 2f
+        val mz = (pA.tz() + pB.tz()) / 2f
+        val dist = sqrt(
+          ((pB.tx()-pA.tx()).let{it*it} + (pB.ty()-pA.ty()).let{it*it} + (pB.tz()-pA.tz()).let{it*it}).toDouble()
+        ).toFloat()
+        val screen = project3DToScreen(mx, my, mz) ?: return
+        labels.add(mapOf(
+          "id" to id, "text" to formatDist(dist), "distance" to dist,
+          "screenX" to screen[0], "screenY" to screen[1], "visible" to true
+        ))
+      }
+
+      if (poses.size >= 2) maybeAddLabel(poses[0], poses[1], "L12")
+      if (poses.size >= 3) maybeAddLabel(poses[1], poses[2], "L23")
+      if (poses.size >= 4) {
+        maybeAddLabel(poses[2], poses[3], "L34")
+        maybeAddLabel(poses[3], poses[0], "L41")
+      }
+      if (poses.isNotEmpty() && poses.size < 4 && currentCandidate != null) {
+        maybeAddLabel(poses.last(), currentCandidate, "PREVIEW")
+      }
+
+      val candScreen = currentCandidate?.let {
+        project3DToScreen(it.tx(), it.ty(), it.tz())
+      }
+
+      val diagnostics = mapOf(
+        "reticleX" to (displayWidth / 2.0f),
+        "reticleY" to (displayHeight / 2.0f),
+        "viewportW" to displayWidth,
+        "viewportH" to displayHeight,
+        "rotation" to displayRotation,
+        "candidateX" to (currentCandidate?.tx() ?: 0.0f),
+        "candidateY" to (currentCandidate?.ty() ?: 0.0f),
+        "candidateZ" to (currentCandidate?.tz() ?: 0.0f),
+        "p1" to (if (poses.size >= 1) listOf(poses[0].tx(), poses[0].ty(), poses[0].tz()) else null),
+        "p2" to (if (poses.size >= 2) listOf(poses[1].tx(), poses[1].ty(), poses[1].tz()) else null),
+        "p3" to (if (poses.size >= 3) listOf(poses[2].tx(), poses[2].ty(), poses[2].tz()) else null),
+        "p4" to (if (poses.size >= 4) listOf(poses[3].tx(), poses[3].ty(), poses[3].tz()) else null)
+      )
+
+      postOverlayUpdate(
+        trackingQuality = "GOOD",
+        candidateValid = candidateValid,
+        candidateScreenX = candScreen?.get(0) ?: (displayWidth / 2f),
+        candidateScreenY = candScreen?.get(1) ?: (displayHeight / 2f),
+        labels = labels,
+        diagnostics = diagnostics
+      )
+    }
+
+    private fun project3DToScreen(x: Float, y: Float, z: Float): FloatArray? {
+      val clipX = viewProjectionMatrix[0]*x + viewProjectionMatrix[4]*y + viewProjectionMatrix[8]*z + viewProjectionMatrix[12]
+      val clipY = viewProjectionMatrix[1]*x + viewProjectionMatrix[5]*y + viewProjectionMatrix[9]*z + viewProjectionMatrix[13]
+      val clipW = viewProjectionMatrix[3]*x + viewProjectionMatrix[7]*y + viewProjectionMatrix[11]*z + viewProjectionMatrix[15]
+
+      if (clipW <= 0.001f) return null
+
+      val ndcX = clipX / clipW
+      val ndcY = clipY / clipW
+
+      if (ndcX < -1.2f || ndcX > 1.2f || ndcY < -1.2f || ndcY > 1.2f) return null
+
+      val screenX = (ndcX + 1.0f) * 0.5f * displayWidth
+      val screenY = (1.0f - ndcY) * 0.5f * displayHeight
+      return floatArrayOf(screenX, screenY)
+    }
+
+    // ==========================================================
+    // DRAW CAMERA BACKGROUND
     // ==========================================================
 
     private fun setupCameraTexture() {
+      val textures = IntArray(1)
+      GLES20.glGenTextures(1, textures, 0)
+      cameraTextureId = textures[0]
 
-      val textures =
-        IntArray(1)
-
-      GLES20.glGenTextures(
-        1,
-        textures,
-        0
-      )
-
-      cameraTextureId =
-        textures[0]
-
-      GLES20.glBindTexture(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        cameraTextureId
-      )
-
-      GLES20.glTexParameteri(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        GLES20.GL_TEXTURE_MIN_FILTER,
-        GLES20.GL_LINEAR
-      )
-
-      GLES20.glTexParameteri(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        GLES20.GL_TEXTURE_MAG_FILTER,
-        GLES20.GL_LINEAR
-      )
-
-      GLES20.glTexParameteri(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        GLES20.GL_TEXTURE_WRAP_S,
-        GLES20.GL_CLAMP_TO_EDGE
-      )
-
-      GLES20.glTexParameteri(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        GLES20.GL_TEXTURE_WRAP_T,
-        GLES20.GL_CLAMP_TO_EDGE
-      )
-
-      GLES20.glBindTexture(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        0
-      )
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+      GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
-
-    // ==========================================================
-    // CAMERA SHADER
-    // ==========================================================
 
     private fun setupCameraShader() {
-
-      val vertexShader =
-        """
+      val vertexShader = """
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
-
         varying vec2 vTexCoord;
-
         void main() {
-
-          gl_Position =
-            aPosition;
-
-          vTexCoord =
-            aTexCoord;
+          gl_Position = aPosition;
+          vTexCoord = aTexCoord;
         }
-        """.trimIndent()
+      """.trimIndent()
 
-      val fragmentShader =
-        """
+      val fragmentShader = """
         #extension GL_OES_EGL_image_external : require
-
         precision mediump float;
-
         uniform samplerExternalOES uTexture;
-
         varying vec2 vTexCoord;
-
         void main() {
-
-          gl_FragColor =
-            texture2D(
-              uTexture,
-              vTexCoord
-            );
+          gl_FragColor = texture2D(uTexture, vTexCoord);
         }
-        """.trimIndent()
+      """.trimIndent()
 
-      cameraProgram =
-        createProgram(
-          vertexShader,
-          fragmentShader
-        )
-
-      cameraPositionHandle =
-        GLES20.glGetAttribLocation(
-          cameraProgram,
-          "aPosition"
-        )
-
-      cameraTexCoordHandle =
-        GLES20.glGetAttribLocation(
-          cameraProgram,
-          "aTexCoord"
-        )
-
-      cameraTextureHandle =
-        GLES20.glGetUniformLocation(
-          cameraProgram,
-          "uTexture"
-        )
+      cameraProgram = createProgram(vertexShader, fragmentShader)
+      cameraPositionHandle = GLES20.glGetAttribLocation(cameraProgram, "aPosition")
+      cameraTexCoordHandle = GLES20.glGetAttribLocation(cameraProgram, "aTexCoord")
+      cameraTextureHandle = GLES20.glGetUniformLocation(cameraProgram, "uTexture")
     }
 
-    // ==========================================================
-    // DRAW CAMERA
-    // ==========================================================
-
-    private fun drawCamera(
-      frame: Frame
-    ) {
-
+    private fun drawCamera(frame: Frame) {
       try {
-
-        /*
-         * Transform the camera UV coordinates according to
-         * ARCore display geometry.
-         */
         frame.transformCoordinates2d(
           Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
           cameraVertices,
           Coordinates2d.TEXTURE_NORMALIZED,
           transformedTexCoords
         )
-
         cameraTexCoordBuffer.clear()
-
-        cameraTexCoordBuffer.put(
-          transformedTexCoords
-        )
-
+        cameraTexCoordBuffer.put(transformedTexCoords)
         cameraTexCoordBuffer.position(0)
+      } catch (_: Exception) {}
 
-      } catch (_: Exception) {
-      }
-
-      GLES20.glDisable(
-        GLES20.GL_DEPTH_TEST
-      )
-
-      GLES20.glUseProgram(
-        cameraProgram
-      )
+      GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+      GLES20.glUseProgram(cameraProgram)
 
       cameraVertexBuffer.position(0)
-
-      GLES20.glEnableVertexAttribArray(
-        cameraPositionHandle
-      )
-
-      GLES20.glVertexAttribPointer(
-        cameraPositionHandle,
-        2,
-        GLES20.GL_FLOAT,
-        false,
-        0,
-        cameraVertexBuffer
-      )
+      GLES20.glEnableVertexAttribArray(cameraPositionHandle)
+      GLES20.glVertexAttribPointer(cameraPositionHandle, 2, GLES20.GL_FLOAT, false, 0, cameraVertexBuffer)
 
       cameraTexCoordBuffer.position(0)
+      GLES20.glEnableVertexAttribArray(cameraTexCoordHandle)
+      GLES20.glVertexAttribPointer(cameraTexCoordHandle, 2, GLES20.GL_FLOAT, false, 0, cameraTexCoordBuffer)
 
-      GLES20.glEnableVertexAttribArray(
-        cameraTexCoordHandle
-      )
+      GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+      GLES20.glUniform1i(cameraTextureHandle, 0)
 
-      GLES20.glVertexAttribPointer(
-        cameraTexCoordHandle,
-        2,
-        GLES20.GL_FLOAT,
-        false,
-        0,
-        cameraTexCoordBuffer
-      )
+      GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-      GLES20.glActiveTexture(
-        GLES20.GL_TEXTURE0
-      )
-
-      GLES20.glBindTexture(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        cameraTextureId
-      )
-
-      GLES20.glUniform1i(
-        cameraTextureHandle,
-        0
-      )
-
-      GLES20.glDrawArrays(
-        GLES20.GL_TRIANGLE_STRIP,
-        0,
-        4
-      )
-
-      GLES20.glDisableVertexAttribArray(
-        cameraPositionHandle
-      )
-
-      GLES20.glDisableVertexAttribArray(
-        cameraTexCoordHandle
-      )
-
-      GLES20.glBindTexture(
-        GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-        0
-      )
+      GLES20.glDisableVertexAttribArray(cameraPositionHandle)
+      GLES20.glDisableVertexAttribArray(cameraTexCoordHandle)
+      GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
 
     // ==========================================================
-    // MEASUREMENT SHADER
+    // SETUP POINT SHADER (iPhone Measure circular white points)
     // ==========================================================
 
-    private fun setupMeasurementShader() {
-
-      val vertexShader =
-        """
+    private fun setupPointShader() {
+      val vertexShader = """
         uniform mat4 uViewProjection;
         attribute vec3 aPosition;
-
+        uniform float uPointSize;
         void main() {
           gl_Position = uViewProjection * vec4(aPosition, 1.0);
-          gl_PointSize = 20.0;
+          gl_PointSize = uPointSize;
         }
-        """.trimIndent()
+      """.trimIndent()
 
-      val fragmentShader =
-        """
+      val fragmentShader = """
         precision mediump float;
-
         uniform vec4 uColor;
-
         void main() {
-
-          gl_FragColor =
-            uColor;
+          vec2 coord = gl_PointCoord - vec2(0.5);
+          float dist = length(coord);
+          if (dist > 0.5) {
+            discard;
+          }
+          float core = smoothstep(0.24, 0.16, dist);
+          float ring = smoothstep(0.48, 0.40, dist) * smoothstep(0.24, 0.32, dist);
+          float alpha = max(core, ring * 0.75);
+          gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
         }
-        """.trimIndent()
+      """.trimIndent()
 
-      measurementProgram =
-        createProgram(
-          vertexShader,
-          fragmentShader
-        )
-
-      measurementPositionHandle =
-        GLES20.glGetAttribLocation(
-          measurementProgram,
-          "aPosition"
-        )
-
-      measurementColorHandle =
-        GLES20.glGetUniformLocation(
-          measurementProgram,
-          "uColor"
-        )
-
-      measurementViewProjectionHandle =
-        GLES20.glGetUniformLocation(
-          measurementProgram,
-          "uViewProjection"
-        )
+      pointProgram = createProgram(vertexShader, fragmentShader)
+      pointPositionHandle = GLES20.glGetAttribLocation(pointProgram, "aPosition")
+      pointColorHandle = GLES20.glGetUniformLocation(pointProgram, "uColor")
+      pointSizeHandle = GLES20.glGetUniformLocation(pointProgram, "uPointSize")
+      pointViewProjectionHandle = GLES20.glGetUniformLocation(pointProgram, "uViewProjection")
     }
 
     // ==========================================================
-    // WORLD ANCHORED MEASUREMENTS
+    // SETUP LINE SHADER (Thin white lines)
     // ==========================================================
 
+    private fun setupLineShader() {
+      val vertexShader = """
+        uniform mat4 uViewProjection;
+        attribute vec3 aPosition;
+        void main() {
+          gl_Position = uViewProjection * vec4(aPosition, 1.0);
+        }
+      """.trimIndent()
+
+      val fragmentShader = """
+        precision mediump float;
+        uniform vec4 uColor;
+        void main() {
+          gl_FragColor = uColor;
+        }
+      """.trimIndent()
+
+      lineProgram = createProgram(vertexShader, fragmentShader)
+      linePositionHandle = GLES20.glGetAttribLocation(lineProgram, "aPosition")
+      lineColorHandle = GLES20.glGetUniformLocation(lineProgram, "uColor")
+      lineViewProjectionHandle = GLES20.glGetUniformLocation(lineProgram, "uViewProjection")
+    }
+
     // ==========================================================
-    // WORLD ANCHORED MEASUREMENTS
+    // DRAW WORLD MEASUREMENTS
     // ==========================================================
 
     private fun drawWorldMeasurements() {
+      if (measurementAnchors.isEmpty() && frozenPositions == null) return
 
-      if (measurementAnchors.isEmpty()) {
-        return
+      val poses = if (frozenPositions != null) {
+        frozenPositions!!.map { Pose.makeTranslation(it[0], it[1], it[2]) }
+      } else {
+        measurementAnchors.map { getAnchorPose(it) }
+      }
+      if (poses.isEmpty()) return
+
+      val n = poses.size
+
+      // Build line segments between consecutive confirmed points
+      val lineVerts = mutableListOf<Float>()
+      for (i in 0 until n - 1) {
+        lineVerts += listOf(poses[i].tx(), poses[i].ty(), poses[i].tz())
+        lineVerts += listOf(poses[i+1].tx(), poses[i+1].ty(), poses[i+1].tz())
+      }
+      if (n == 4) {
+        lineVerts += listOf(poses[3].tx(), poses[3].ty(), poses[3].tz())
+        lineVerts += listOf(poses[0].tx(), poses[0].ty(), poses[0].tz())
       }
 
-      // Collect 3D positions of all anchors
-      val pointsList = mutableListOf<FloatArray>()
-      for (item in measurementAnchors) {
-        val anchor = item.anchor
-        if (anchor.trackingState == TrackingState.TRACKING) {
-          val pose = anchor.pose
-          pointsList.add(floatArrayOf(pose.tx(), pose.ty(), pose.tz()))
-        }
-      }
-
-      if (pointsList.isEmpty()) {
-        return
-      }
-
-      // Prepare vertices for points
-      val pointVertices = FloatArray(pointsList.size * 3)
-      for (i in pointsList.indices) {
-        pointVertices[i * 3] = pointsList[i][0]
-        pointVertices[i * 3 + 1] = pointsList[i][1]
-        pointVertices[i * 3 + 2] = pointsList[i][2]
-      }
-
-      // Prepare vertices for lines
-      val lineVerticesList = mutableListOf<Float>()
-      for (i in 0 until pointsList.size - 1) {
-        lineVerticesList.add(pointsList[i][0])
-        lineVerticesList.add(pointsList[i][1])
-        lineVerticesList.add(pointsList[i][2])
-        lineVerticesList.add(pointsList[i + 1][0])
-        lineVerticesList.add(pointsList[i + 1][1])
-        lineVerticesList.add(pointsList[i + 1][2])
-      }
-
-      // Close polygon if 4 points
-      if (pointsList.size == 4) {
-        lineVerticesList.add(pointsList.last()[0])
-        lineVerticesList.add(pointsList.last()[1])
-        lineVerticesList.add(pointsList.last()[2])
-        lineVerticesList.add(pointsList.first()[0])
-        lineVerticesList.add(pointsList.first()[1])
-        lineVerticesList.add(pointsList.first()[2])
+      // Build point vertex array
+      val pointVerts = FloatArray(n * 3)
+      for (i in poses.indices) {
+        pointVerts[i*3]   = poses[i].tx()
+        pointVerts[i*3+1] = poses[i].ty()
+        pointVerts[i*3+2] = poses[i].tz()
       }
 
       GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+      GLES20.glEnable(GLES20.GL_BLEND)
+      GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-      if (lineVerticesList.isNotEmpty()) {
-        drawLines3D(lineVerticesList.toFloatArray())
+      if (lineVerts.isNotEmpty()) {
+        drawLines3D(lineVerts.toFloatArray(), floatArrayOf(1f, 1f, 1f, 1f), 3.0f)
       }
+      drawPoints3D(pointVerts, floatArrayOf(1f, 1f, 1f, 1f), 34.0f)
 
-      drawPoints3D(pointVertices)
+      GLES20.glDisable(GLES20.GL_BLEND)
     }
 
-    // ==========================================================
-    // LIVE PREVIEW (3D)
-    // ==========================================================
-
-    private fun drawPreview() {
-
-      if (!previewEnabled || measurementAnchors.isEmpty()) {
-        return
-      }
-
-      val last = measurementAnchors.last()
-      if (last.anchor.trackingState != TrackingState.TRACKING) {
-        return
-      }
-
-      val frame = latestFrame ?: return
-      if (frame.camera.trackingState != TrackingState.TRACKING) {
-        return
-      }
-
-      // Hit test current screen coordinate to find 3D world pose
-      val hits = frame.hitTest(previewScreenX, previewScreenY)
-      var previewPose: com.google.ar.core.Pose? = null
-
-      for (hit in hits) {
-        val trackable = hit.trackable
-        if (trackable is com.google.ar.core.Plane && trackable.trackingState == TrackingState.TRACKING) {
-          previewPose = hit.hitPose
-          break
-        }
-      }
-
-      if (previewPose == null) {
-        return
-      }
-
-      val p1 = last.anchor.pose
-      val p2 = previewPose
-
-      val lineVertices = floatArrayOf(
-        p1.tx(), p1.ty(), p1.tz(),
-        p2.tx(), p2.ty(), p2.tz()
-      )
-
-      val pointVertices = floatArrayOf(
-        p2.tx(), p2.ty(), p2.tz()
-      )
-
-      drawLines3D(lineVertices)
-      drawPoints3D(pointVertices)
-    }
-
-    // ==========================================================
-    // DRAW 3D LINES
-    // ==========================================================
-
-    private fun drawLines3D(vertices: FloatArray) {
-
+    private fun drawLines3D(vertices: FloatArray, color: FloatArray = floatArrayOf(1f, 1f, 1f, 1f), lineWidth: Float = 3.5f) {
+      if (vertices.isEmpty()) return
       val buffer = createFloatBuffer(vertices)
 
-      GLES20.glUseProgram(measurementProgram)
+      GLES20.glUseProgram(lineProgram)
       buffer.position(0)
 
-      GLES20.glEnableVertexAttribArray(measurementPositionHandle)
-      GLES20.glVertexAttribPointer(
-        measurementPositionHandle, 3, GLES20.GL_FLOAT, false, 0, buffer
-      )
+      GLES20.glEnableVertexAttribArray(linePositionHandle)
+      GLES20.glVertexAttribPointer(linePositionHandle, 3, GLES20.GL_FLOAT, false, 0, buffer)
 
-      // Upload ViewProjection matrix
-      GLES20.glUniformMatrix4fv(
-        measurementViewProjectionHandle, 1, false, viewProjectionMatrix, 0
-      )
+      GLES20.glUniformMatrix4fv(lineViewProjectionHandle, 1, false, viewProjectionMatrix, 0)
+      GLES20.glUniform4fv(lineColorHandle, 1, color, 0)
 
-      // Color White
-      GLES20.glUniform4f(measurementColorHandle, 1f, 1f, 1f, 1f)
-
-      // Draw lines
-      GLES20.glLineWidth(5f)
+      GLES20.glLineWidth(lineWidth)
       GLES20.glDrawArrays(GLES20.GL_LINES, 0, vertices.size / 3)
 
-      GLES20.glDisableVertexAttribArray(measurementPositionHandle)
+      GLES20.glDisableVertexAttribArray(linePositionHandle)
     }
 
-    // ==========================================================
-    // DRAW 3D POINTS
-    // ==========================================================
-
-    private fun drawPoints3D(vertices: FloatArray) {
-
+    private fun drawPoints3D(vertices: FloatArray, color: FloatArray = floatArrayOf(1f, 1f, 1f, 1f), pointSize: Float = 32.0f) {
+      if (vertices.isEmpty()) return
       val buffer = createFloatBuffer(vertices)
 
-      GLES20.glUseProgram(measurementProgram)
+      GLES20.glUseProgram(pointProgram)
       buffer.position(0)
 
-      GLES20.glEnableVertexAttribArray(measurementPositionHandle)
-      GLES20.glVertexAttribPointer(
-        measurementPositionHandle, 3, GLES20.GL_FLOAT, false, 0, buffer
-      )
+      GLES20.glEnableVertexAttribArray(pointPositionHandle)
+      GLES20.glVertexAttribPointer(pointPositionHandle, 3, GLES20.GL_FLOAT, false, 0, buffer)
 
-      // Upload ViewProjection matrix
-      GLES20.glUniformMatrix4fv(
-        measurementViewProjectionHandle, 1, false, viewProjectionMatrix, 0
-      )
+      GLES20.glUniformMatrix4fv(pointViewProjectionHandle, 1, false, viewProjectionMatrix, 0)
+      GLES20.glUniform4fv(pointColorHandle, 1, color, 0)
+      GLES20.glUniform1f(pointSizeHandle, pointSize)
 
-      // Color White
-      GLES20.glUniform4f(measurementColorHandle, 1f, 1f, 1f, 1f)
-
-      // Draw points
       GLES20.glDrawArrays(GLES20.GL_POINTS, 0, vertices.size / 3)
 
-      GLES20.glDisableVertexAttribArray(measurementPositionHandle)
+      GLES20.glDisableVertexAttribArray(pointPositionHandle)
     }
 
-    // ==========================================================
-    // PREVIEW CONTROL
-    // ==========================================================
 
-    fun setPreview(
-      enabled: Boolean,
-      x: Float,
-      y: Float
-    ) {
-
-      previewEnabled =
-        enabled
-
-      previewScreenX =
-        x
-
-      previewScreenY =
-        y
-    }
-
-    // ==========================================================
-    // FLOAT BUFFER
-    // ==========================================================
-
-    private fun createFloatBuffer(
-      values: FloatArray
-    ): FloatBuffer {
-
-      return ByteBuffer
-        .allocateDirect(
-          values.size * 4
-        )
-        .order(
-          ByteOrder.nativeOrder()
-        )
+    private fun createFloatBuffer(values: FloatArray): FloatBuffer {
+      return ByteBuffer.allocateDirect(values.size * 4)
+        .order(ByteOrder.nativeOrder())
         .asFloatBuffer()
         .apply {
-
           put(values)
-
           position(0)
         }
     }
 
-    // ==========================================================
-    // CREATE OPENGL PROGRAM
-    // ==========================================================
-
-    private fun createProgram(
-      vertexSource: String,
-      fragmentSource: String
-    ): Int {
-
-      // --------------------------------------------------------
-      // VERTEX SHADER
-      // --------------------------------------------------------
-
-      val vertexShader =
-        GLES20.glCreateShader(
-          GLES20.GL_VERTEX_SHADER
-        )
-
-      GLES20.glShaderSource(
-        vertexShader,
-        vertexSource
-      )
-
-      GLES20.glCompileShader(
-        vertexShader
-      )
-
-      val vertexStatus =
-        IntArray(1)
-
-      GLES20.glGetShaderiv(
-        vertexShader,
-        GLES20.GL_COMPILE_STATUS,
-        vertexStatus,
-        0
-      )
-
-      if (vertexStatus[0] == 0) {
-
-        val error =
-          GLES20.glGetShaderInfoLog(
-            vertexShader
-          )
-
-        GLES20.glDeleteShader(
-          vertexShader
-        )
-
-        throw RuntimeException(
-          "Vertex shader failed: $error"
-        )
+    private fun createProgram(vertexSource: String, fragmentSource: String): Int {
+      fun compileShader(type: Int, source: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, source)
+        GLES20.glCompileShader(shader)
+        val status = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
+        if (status[0] == 0) {
+          val log = GLES20.glGetShaderInfoLog(shader)
+          GLES20.glDeleteShader(shader)
+          throw RuntimeException("Shader compile failed: $log")
+        }
+        return shader
       }
-
-      // --------------------------------------------------------
-      // FRAGMENT SHADER
-      // --------------------------------------------------------
-
-      val fragmentShader =
-        GLES20.glCreateShader(
-          GLES20.GL_FRAGMENT_SHADER
-        )
-
-      GLES20.glShaderSource(
-        fragmentShader,
-        fragmentSource
-      )
-
-      GLES20.glCompileShader(
-        fragmentShader
-      )
-
-      val fragmentStatus =
-        IntArray(1)
-
-      GLES20.glGetShaderiv(
-        fragmentShader,
-        GLES20.GL_COMPILE_STATUS,
-        fragmentStatus,
-        0
-      )
-
-      if (fragmentStatus[0] == 0) {
-
-        val error =
-          GLES20.glGetShaderInfoLog(
-            fragmentShader
-          )
-
-        GLES20.glDeleteShader(
-          fragmentShader
-        )
-
-        throw RuntimeException(
-          "Fragment shader failed: $error"
-        )
-      }
-
-      // --------------------------------------------------------
-      // LINK
-      // --------------------------------------------------------
-
-      val program =
-        GLES20.glCreateProgram()
-
-      GLES20.glAttachShader(
-        program,
-        vertexShader
-      )
-
-      GLES20.glAttachShader(
-        program,
-        fragmentShader
-      )
-
-      GLES20.glLinkProgram(
-        program
-      )
-
-      val linkStatus =
-        IntArray(1)
-
-      GLES20.glGetProgramiv(
-        program,
-        GLES20.GL_LINK_STATUS,
-        linkStatus,
-        0
-      )
-
+      val vert = compileShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+      val frag = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
+      val program = GLES20.glCreateProgram()
+      GLES20.glAttachShader(program, vert)
+      GLES20.glAttachShader(program, frag)
+      GLES20.glLinkProgram(program)
+      val linkStatus = IntArray(1)
+      GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
       if (linkStatus[0] == 0) {
-
-        val error =
-          GLES20.glGetProgramInfoLog(
-            program
-          )
-
-        GLES20.glDeleteProgram(
-          program
-        )
-
-        throw RuntimeException(
-          "OpenGL linking failed: $error"
-        )
+        val log = GLES20.glGetProgramInfoLog(program)
+        GLES20.glDeleteProgram(program)
+        throw RuntimeException("Program link failed: $log")
       }
-
-      GLES20.glDeleteShader(
-        vertexShader
-      )
-
-      GLES20.glDeleteShader(
-        fragmentShader
-      )
-
+      GLES20.glDeleteShader(vert)
+      GLES20.glDeleteShader(frag)
       return program
     }
   }

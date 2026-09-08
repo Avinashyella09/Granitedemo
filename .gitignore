@@ -16,3 +16,16 @@ __pycache__/
 *.pt
 annotated_synthetic_output.png
 synthetic_block.png
+
+# Media & Temp Files
+/backend/media/
+/backend/error_500_traceback.html
+scratch/
+
+# Android Build Artifacts
+**/android/.gradle/
+**/android/build/
+**/android/app/build/
+**/modules/granite-ar/android/build/
+*.apk
+

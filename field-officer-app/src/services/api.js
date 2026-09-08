@@ -1,4 +1,4 @@
-let apiBaseUrl = 'http://192.168.0.201:8000'; // Active LAN IP for physical device testing
+let apiBaseUrl = 'http://192.168.1.161:8000'; // Active LAN IP for physical device testing
 
 export const setApiBaseUrl = (url) => {
   if (url.endsWith('/')) {
@@ -75,17 +75,45 @@ export const apiService = {
     formData.append('breadth_m', String(breadth_m));
     formData.append('height_m',  String(height_m));
     formData.append('volume_m3', String(volume_m3));
-
-    const res = await fetch(`${apiBaseUrl}/api/blocks/ar-measure/`, {
-      method: 'POST',
-      body: formData,
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to submit AR inspection.');
+    if (params.ar_points) {
+      formData.append('ar_points', JSON.stringify(params.ar_points));
     }
-    return data;
+
+    const endpoint = `${apiBaseUrl}/api/blocks/ar-measure/`;
+    const t0 = Date.now();
+    console.log(`[PERF] FormData constructed: ${t0 - (params._tStart || t0)} ms`);
+    console.log(`[PERF] Upload started: ${new Date().toISOString()}`);
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        body: formData,
+      });
+      const tUpload = Date.now();
+      console.log(`[PERF] Upload & Server roundtrip completed: ${tUpload - t0} ms`);
+
+      const text = await res.text();
+      let data = {};
+      try {
+        data = JSON.parse(text);
+      } catch (jsonErr) {
+        console.error(`[API] Server returned non-JSON response (${res.status}):`, text);
+        throw new Error(`Server response error (${res.status}). Check server logs.`);
+      }
+
+      if (!res.ok) {
+        console.error(`[API] Error ${res.status}:`, data);
+        throw new Error(data.error || `Server error (${res.status}).`);
+      }
+      console.log(`[API] AR Inspection submitted successfully:`, data);
+      return data;
+    } catch (err) {
+      console.error(`[API] Network error calling ${endpoint}:`, err.message || err);
+      if (err.message && err.message.toLowerCase().includes('network request failed')) {
+        throw new Error(`Unable to connect to Django server. Check that Django is running on ${apiBaseUrl.replace('http://', '')} and that phone and PC are on the same Wi-Fi.`);
+      }
+      throw err;
+    }
   },
 
   measureBlockCV: async (blockId, imageUri) => {

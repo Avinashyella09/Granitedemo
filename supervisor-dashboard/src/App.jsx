@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiService } from './services/api';
+import { apiService, clearApiCache } from './services/api';
 import { 
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, 
   Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell 
@@ -64,6 +64,11 @@ export default function App() {
   useEffect(() => {
     loadAllData();
   }, []);
+
+  const handleManualRefresh = async () => {
+    clearApiCache();
+    await loadAllData();
+  };
 
   const loadAllData = async () => {
     setLoading(true);
@@ -307,14 +312,14 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  // Filter block registrations lists
+  // Filter & sort block registrations lists (newest registered blocks first)
   const filteredBlocks = blocks.filter(b => {
     const matchSearch = b.block_id.toLowerCase().includes(search.toLowerCase());
-    const matchQuarry = quarryFilter === 'all' || b.quarry?.id === quarryFilter;
+    const matchQuarry = quarryFilter === 'all' || (b.quarry?.id === quarryFilter || b.quarry_id === quarryFilter);
     const matchStatus = statusFilter === 'all' || (b.approval_status || 'pending') === statusFilter;
     const matchCvStatus = cvStatusFilter === 'all' || (b.cv_status || 'pending') === cvStatusFilter;
     return matchSearch && matchQuarry && matchStatus && matchCvStatus;
-  });
+  }).sort((a, b) => new Date(b.created_at || b.captured_at || 0) - new Date(a.created_at || a.captured_at || 0));
 
   const COLORS = ['#10b981', '#f59e0b', '#ef4444']; // Green, Amber, Red compliance
 
@@ -334,7 +339,7 @@ export default function App() {
         </div>
         
         {/* Navigation panel */}
-        <nav style={{ display: 'flex', gap: '0.5rem' }}>
+        <nav style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
           <button onClick={() => setActiveTab('overview')} className={`nav-btn ${activeTab === 'overview' ? 'active' : ''}`}>Overview</button>
           <button onClick={() => setActiveTab('registry')} className={`nav-btn ${activeTab === 'registry' ? 'active' : ''}`}>Blocks Registry</button>
           <button onClick={() => setActiveTab('officers')} className={`nav-btn ${activeTab === 'officers' ? 'active' : ''}`}>Officers Analytics</button>
@@ -769,7 +774,9 @@ export default function App() {
               </div>
 
               <div className="card">
-                <div className="card-title">Blocks Registry ({filteredBlocks.length})</div>
+                <div className="card-title">
+                  <span>Blocks Registry ({filteredBlocks.length})</span>
+                </div>
                 <div style={{ maxHeight: '400px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                   {filteredBlocks.map(b => (
                     <div 
