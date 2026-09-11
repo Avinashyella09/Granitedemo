@@ -9,7 +9,9 @@ import {
   Image,
   ActivityIndicator,
   Alert,
-  Dimensions
+  Dimensions,
+  Modal,
+  Animated
 } from 'react-native';
 
 import { StatusBar } from 'expo-status-bar';
@@ -60,6 +62,29 @@ export default function App() {
   const [trackingQuality, setTrackingQuality] = useState('GOOD');
   const [arDiagnostics, setArDiagnostics] = useState(null);
   const [showDiag, setShowDiag] = useState(false);
+
+  // =========================================================
+  // AR steadiness (accelerometer motion gate)
+  //
+  // The device has no LiDAR, so measurement quality rests on ARCore keeping
+  // visual-inertial tracking converged. The native view watches the
+  // accelerometer and reports STEADY / MOVING; while MOVING the measurement is
+  // halted and a blocking popup asks the officer to hold still. Points already
+  // locked are preserved, so a bump costs a pause and not the whole scan.
+  // =========================================================
+
+  const [arSteady, setArSteady] = useState(true);
+  const [arMotionMagnitude, setArMotionMagnitude] = useState(0);
+  const [arMotionThreshold, setArMotionThreshold] = useState(0.55);
+  const [arMotionSensorAvailable, setArMotionSensorAvailable] = useState(true);
+  const [showSteadyPopup, setShowSteadyPopup] = useState(false);
+
+  // Pulsing ring behind the popup icon, driven while the popup is visible.
+  const steadyPulse = React.useRef(new Animated.Value(0)).current;
+
+  // Latest point count, readable from the native event callback without
+  // re-subscribing the native view on every point placement.
+  const arPointsCountRef = React.useRef(0);
 
   // Whether we are submitting the final inspection
   const [submitting, setSubmitting] = useState(false);
@@ -928,6 +953,8 @@ export default function App() {
     setArOverlayLabels([]);
     setCandidateValid(false);
     setTrackingQuality('GOOD');
+    setShowSteadyPopup(false);
+    setArMotionMagnitude(0);
     setTapToken(0);
     setResetToken((t) => t + 1);
   };
@@ -948,9 +975,99 @@ export default function App() {
     if (data.diagnostics) {
       setArDiagnostics(data.diagnostics);
     }
+    if (typeof data.motionMagnitude === 'number') {
+      setArMotionMagnitude(data.motionMagnitude);
+    }
+    if (typeof data.movingThreshold === 'number') {
+      setArMotionThreshold(data.movingThreshold);
+    }
+    if (typeof data.motionSensorAvailable === 'boolean') {
+      setArMotionSensorAvailable(data.motionSensorAvailable);
+    }
   };
 
+  // =========================================================
+  // Accelerometer steadiness transitions
+  // =========================================================
+
+  const handleARSteadyChange = (event) => {
+    const data = event.nativeEvent;
+    if (!data) return;
+
+    const steady = !!data.steady;
+    setArSteady(steady);
+
+    if (typeof data.magnitude === 'number') {
+      setArMotionMagnitude(data.magnitude);
+    }
+    if (typeof data.sensorAvailable === 'boolean') {
+      setArMotionSensorAvailable(data.sensorAvailable);
+    }
+
+    console.log(
+      `AR MOTION: ${data.state} mag=${Number(data.magnitude || 0).toFixed(3)} ` +
+      `peak=${Number(data.peakMagnitude || 0).toFixed(3)} points=${data.pointsPlaced}`
+    );
+
+    if (!steady) {
+      // Only interrupt while a measurement is actually in progress. Once all
+      // four corners are locked the numbers are frozen, so movement is
+      // harmless and a popup would just be in the way.
+      if (arPointsCountRef.current < 4) {
+        setShowSteadyPopup(true);
+      }
+    } else {
+      setShowSteadyPopup(false);
+    }
+  };
+
+  // Keep the ref in sync so the native callback can read the live count.
+  useEffect(() => {
+    arPointsCountRef.current = arPoints.length;
+
+    // Movement after the final point no longer matters.
+    if (arPoints.length >= 4) {
+      setShowSteadyPopup(false);
+    }
+  }, [arPoints.length]);
+
+  // Leaving the AR screen must never strand the popup on top of another view.
+  useEffect(() => {
+    if (screen !== 'ar-measure') {
+      setShowSteadyPopup(false);
+    }
+  }, [screen]);
+
+  // Pulse the popup icon ring while the phone is being held still.
+  useEffect(() => {
+    if (!showSteadyPopup) {
+      steadyPulse.setValue(0);
+      return;
+    }
+
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(steadyPulse, {
+          toValue: 1,
+          duration: 900,
+          useNativeDriver: true
+        }),
+        Animated.timing(steadyPulse, {
+          toValue: 0,
+          duration: 900,
+          useNativeDriver: true
+        })
+      ])
+    );
+
+    loop.start();
+    return () => loop.stop();
+  }, [showSteadyPopup, steadyPulse]);
+
   const getARInstruction = () => {
+    if (!arSteady) {
+      return 'Hold still — measurement paused';
+    }
     if (trackingQuality === 'INSUFFICIENT') {
       return 'Move phone slowly to scan the block';
     }
@@ -1528,13 +1645,36 @@ export default function App() {
             }}
             onPointSelected={handleARPointSelected}
             onOverlayUpdate={handleAROverlayUpdate}
+            onSteadyChange={handleARSteadyChange}
           />
 
           {/* Center Target Reticle (when points < 4) */}
           {arPoints.length < 4 && (
             <View style={styles.reticleContainer} pointerEvents="none">
-              <View style={[styles.reticleRing, { borderColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]}>
-                <View style={[styles.reticleDot, { backgroundColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]} />
+              <View
+                style={[
+                  styles.reticleRing,
+                  {
+                    borderColor: !arSteady
+                      ? '#f59e0b'
+                      : candidateValid
+                        ? '#FFFFFF'
+                        : 'rgba(255,255,255,0.4)'
+                  }
+                ]}
+              >
+                <View
+                  style={[
+                    styles.reticleDot,
+                    {
+                      backgroundColor: !arSteady
+                        ? '#f59e0b'
+                        : candidateValid
+                          ? '#FFFFFF'
+                          : 'rgba(255,255,255,0.4)'
+                    }
+                  ]}
+                />
               </View>
             </View>
           )}
@@ -1637,14 +1777,28 @@ export default function App() {
                 <TouchableOpacity
                   style={[
                     styles.arPlusBtn,
-                    { backgroundColor: candidateValid ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)' }
+                    {
+                      backgroundColor: !arSteady
+                        ? 'rgba(245,158,11,0.18)'
+                        : candidateValid
+                          ? 'rgba(255,255,255,0.3)'
+                          : 'rgba(255,255,255,0.1)'
+                    }
                   ]}
+                  disabled={!arSteady}
                   onPress={() => {
+                    // Belt-and-braces: the native side rejects taps while moving
+                    // too, but blocking here keeps the popup the single source
+                    // of truth about why nothing happened.
+                    if (!arSteady) {
+                      setShowSteadyPopup(true);
+                      return;
+                    }
                     setTapToken(prev => prev + 1);
                   }}
                   activeOpacity={0.7}
                 >
-                  <View style={styles.arPlusIconInner}>
+                  <View style={[styles.arPlusIconInner, !arSteady && { opacity: 0.35 }]}>
                     <Text style={styles.arPlusText}>+</Text>
                   </View>
                 </TouchableOpacity>
@@ -1670,6 +1824,106 @@ export default function App() {
               </View>
             </View>
           </View>
+
+          {/* =================================================
+              HOLD STEADY POPUP
+
+              Shown whenever the accelerometer reports motion during an
+              in-progress measurement. It is intentionally not dismissable by
+              tapping outside: the measurement is halted until the phone is
+              actually still, and the popup clears itself the moment the native
+              detector reports STEADY again.
+             ================================================= */}
+          <Modal
+            visible={showSteadyPopup}
+            transparent
+            animationType="fade"
+            statusBarTranslucent
+            onRequestClose={() => {}}
+          >
+            <View style={styles.steadyBackdrop}>
+              <View style={styles.steadyCard}>
+
+                <Animated.View
+                  style={[
+                    styles.steadyPulseRing,
+                    {
+                      opacity: steadyPulse.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0.25, 0.7]
+                      }),
+                      transform: [
+                        {
+                          scale: steadyPulse.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [1, 1.18]
+                          })
+                        }
+                      ]
+                    }
+                  ]}
+                />
+
+                <View style={styles.steadyIconCircle}>
+                  <Text style={styles.steadyIcon}>✋</Text>
+                </View>
+
+                <Text style={styles.steadyTitle}>Hold the Phone Steady</Text>
+
+                <Text style={styles.steadyMessage}>
+                  Movement was detected, so the measurement has been paused.
+                  Keep the phone still and it will resume automatically.
+                </Text>
+
+                {/* Live motion meter fed by the accelerometer */}
+                <View style={styles.steadyMeterTrack}>
+                  <View
+                    style={[
+                      styles.steadyMeterFill,
+                      {
+                        width: `${Math.max(
+                          4,
+                          Math.min(
+                            100,
+                            (arMotionMagnitude / Math.max(arMotionThreshold * 2.5, 0.1)) * 100
+                          )
+                        )}%`,
+                        backgroundColor: arMotionMagnitude > arMotionThreshold ? '#ef4444' : '#f59e0b'
+                      }
+                    ]}
+                  />
+                </View>
+
+                <Text style={styles.steadyMeterLabel}>
+                  Motion: {arMotionMagnitude.toFixed(2)} m/s²  (limit {arMotionThreshold.toFixed(2)})
+                </Text>
+
+                {arPoints.length > 0 && (
+                  <Text style={styles.steadyProgressNote}>
+                    {arPoints.length} of 4 points already locked — they have been kept.
+                  </Text>
+                )}
+
+                {!arMotionSensorAvailable && (
+                  <Text style={styles.steadyWarnNote}>
+                    Accelerometer unavailable — steadiness cannot be verified.
+                  </Text>
+                )}
+
+                <TouchableOpacity
+                  style={styles.steadyCancelBtn}
+                  onPress={() => {
+                    setShowSteadyPopup(false);
+                    setScreen('new-inspection');
+                  }}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.steadyCancelText}>Cancel Measurement</Text>
+                </TouchableOpacity>
+
+              </View>
+            </View>
+          </Modal>
         </View>
       )}
 
@@ -3474,6 +3728,107 @@ const styles =
       color: 'rgba(255, 255, 255, 0.5)',
       fontSize: 13,
       fontWeight: '500',
+    },
+
+    // =======================================================
+    // Hold-steady popup (accelerometer motion gate)
+    // =======================================================
+    steadyBackdrop: {
+      flex: 1,
+      backgroundColor: 'rgba(0, 0, 0, 0.78)',
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: 28,
+    },
+    steadyCard: {
+      width: '100%',
+      maxWidth: 380,
+      backgroundColor: '#111827',
+      borderRadius: 22,
+      paddingVertical: 26,
+      paddingHorizontal: 22,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: 'rgba(245, 158, 11, 0.45)',
+    },
+    steadyPulseRing: {
+      position: 'absolute',
+      top: 18,
+      width: 88,
+      height: 88,
+      borderRadius: 44,
+      backgroundColor: 'rgba(245, 158, 11, 0.28)',
+    },
+    steadyIconCircle: {
+      width: 68,
+      height: 68,
+      borderRadius: 34,
+      backgroundColor: 'rgba(245, 158, 11, 0.18)',
+      borderWidth: 2,
+      borderColor: '#f59e0b',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginBottom: 16,
+    },
+    steadyIcon: {
+      fontSize: 32,
+    },
+    steadyTitle: {
+      color: '#FFFFFF',
+      fontSize: 20,
+      fontWeight: '700',
+      textAlign: 'center',
+      marginBottom: 10,
+    },
+    steadyMessage: {
+      color: '#cbd5e1',
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+      marginBottom: 18,
+    },
+    steadyMeterTrack: {
+      width: '100%',
+      height: 8,
+      borderRadius: 4,
+      backgroundColor: 'rgba(255, 255, 255, 0.12)',
+      overflow: 'hidden',
+      marginBottom: 8,
+    },
+    steadyMeterFill: {
+      height: '100%',
+      borderRadius: 4,
+    },
+    steadyMeterLabel: {
+      color: '#94a3b8',
+      fontSize: 12,
+      fontVariant: ['tabular-nums'],
+      marginBottom: 12,
+    },
+    steadyProgressNote: {
+      color: '#22c55e',
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign: 'center',
+      marginBottom: 14,
+    },
+    steadyWarnNote: {
+      color: '#f87171',
+      fontSize: 12,
+      textAlign: 'center',
+      marginBottom: 14,
+    },
+    steadyCancelBtn: {
+      paddingVertical: 10,
+      paddingHorizontal: 20,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: 'rgba(255, 255, 255, 0.25)',
+    },
+    steadyCancelText: {
+      color: '#e2e8f0',
+      fontSize: 13,
+      fontWeight: '600',
     },
     validatedSummaryCard: {
       width: '100%',

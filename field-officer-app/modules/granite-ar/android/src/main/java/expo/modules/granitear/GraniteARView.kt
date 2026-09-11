@@ -4,6 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -51,6 +55,7 @@ class GraniteARView(
   private val onStatus by EventDispatcher()
   private val onPointSelected by EventDispatcher()
   private val onOverlayUpdate by EventDispatcher()
+  private val onSteadyChange by EventDispatcher()
 
   // ============================================================
   // AR SESSION
@@ -134,6 +139,86 @@ class GraniteARView(
   private var cameraTextureId = 0
 
   // ============================================================
+  // ACCELEROMETER MOTION GATE
+  // ============================================================
+  //
+  // This device has no LiDAR, so measurement accuracy depends entirely on
+  // ARCore visual-inertial tracking staying converged. Placing a point while
+  // the phone is in motion is the single largest source of error, so every
+  // point placement is gated on an accelerometer-derived steadiness signal.
+  //
+  // Signal chain (raw TYPE_ACCELEROMETER -> steady/moving decision):
+  //   1. Low-pass the raw reading to estimate the gravity vector.
+  //   2. Linear acceleration = raw - gravity (removes the constant 9.81 m/s2).
+  //   3. Magnitude of that residual is the instantaneous motion energy.
+  //   4. Exponential moving average smooths out single-sample sensor noise.
+  //   5. Schmitt trigger (two thresholds) converts it to a binary state, so a
+  //      value hovering near one threshold cannot flap the popup on and off.
+  //
+  // Translation (panning/walking) shows up directly as linear acceleration.
+  // Rotation in place also registers, because the gravity low-pass lags the
+  // true gravity direction while the phone turns, leaving a residual.
+
+  private var sensorManager: SensorManager? = null
+  private var accelerometer: Sensor? = null
+
+  /** Low-pass smoothing factor for the gravity estimate (higher = slower). */
+  private val gravityAlpha = 0.8f
+
+  /** EMA smoothing factor for the motion magnitude (higher = smoother/slower). */
+  private val motionAlpha = 0.72f
+
+  /** Above this smoothed magnitude (m/s2) the phone is declared MOVING. */
+  @Volatile
+  private var movingThreshold = 0.55f
+
+  /** Below this smoothed magnitude (m/s2) the phone may settle back to STEADY. */
+  @Volatile
+  private var steadyThreshold = 0.28f
+
+  /** Magnitude must stay below [steadyThreshold] this long before STEADY returns. */
+  @Volatile
+  private var steadyHoldMs = 650L
+
+  /** Running gravity estimate; seeded from the first sample to avoid a startup spike. */
+  private val gravity = FloatArray(3)
+  private var gravityInitialized = false
+
+  /** Smoothed linear-acceleration magnitude, in m/s2. */
+  @Volatile
+  private var motionMagnitude = 0f
+
+  /** Peak magnitude seen since the current MOVING episode began (diagnostics only). */
+  @Volatile
+  private var motionPeak = 0f
+
+  /**
+   * True when the phone is steady enough to place a point.
+   *
+   * Starts optimistically true: the detector flips it within ~100 ms of real
+   * motion, which is better UX than flashing the hold-steady popup every time
+   * the AR screen opens.
+   */
+  @Volatile
+  private var isSteady = true
+
+  /** Timestamp when the magnitude first dropped below [steadyThreshold]. */
+  private var calmSince = 0L
+
+  /** Whether the accelerometer is actually delivering samples on this device. */
+  @Volatile
+  private var motionSensorAvailable = false
+
+  private val motionListener = object : SensorEventListener {
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    override fun onSensorChanged(event: SensorEvent) {
+      if (event.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
+      handleAccelerometerSample(event.values)
+    }
+  }
+
+  // ============================================================
   // INITIALIZATION
   // ============================================================
 
@@ -141,7 +226,159 @@ class GraniteARView(
     setBackgroundColor(Color.BLACK)
     isClickable = true
     setupGLSurfaceView()
+    setupMotionSensor()
     createSession()
+  }
+
+  // ============================================================
+  // MOTION SENSOR LIFECYCLE
+  // ============================================================
+
+  private fun setupMotionSensor() {
+    val manager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+    sensorManager = manager
+    accelerometer = manager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+    if (accelerometer == null) {
+      // No accelerometer: fail open rather than blocking measurement outright.
+      motionSensorAvailable = false
+      isSteady = true
+      postStatus(
+        "MOTION_SENSOR_UNAVAILABLE",
+        "No accelerometer on this device. Steadiness checking is disabled."
+      )
+    }
+  }
+
+  private fun startMotionSensor() {
+    val manager = sensorManager ?: return
+    val sensor = accelerometer ?: return
+
+    // SENSOR_DELAY_GAME is ~50 Hz: fast enough to catch a flick of the wrist
+    // without the battery cost of SENSOR_DELAY_FASTEST.
+    val registered = manager.registerListener(
+      motionListener,
+      sensor,
+      SensorManager.SENSOR_DELAY_GAME
+    )
+
+    motionSensorAvailable = registered
+    if (registered) {
+      // Reset the filter so a stale gravity estimate from a previous session
+      // cannot produce a phantom motion spike on the first sample.
+      gravityInitialized = false
+      motionMagnitude = 0f
+      motionPeak = 0f
+      calmSince = 0L
+      isSteady = true
+    }
+  }
+
+  private fun stopMotionSensor() {
+    try {
+      sensorManager?.unregisterListener(motionListener)
+    } catch (_: Exception) {}
+    motionSensorAvailable = false
+  }
+
+  /**
+   * Called on the sensor thread for every accelerometer sample.
+   * Updates [motionMagnitude] and flips [isSteady] through a Schmitt trigger.
+   */
+  private fun handleAccelerometerSample(values: FloatArray) {
+    if (values.size < 3) return
+
+    if (!gravityInitialized) {
+      // Seed gravity with the first sample. Starting from zero would make the
+      // first residual ~9.81 m/s2 and falsely report violent motion.
+      gravity[0] = values[0]
+      gravity[1] = values[1]
+      gravity[2] = values[2]
+      gravityInitialized = true
+      return
+    }
+
+    gravity[0] = gravityAlpha * gravity[0] + (1f - gravityAlpha) * values[0]
+    gravity[1] = gravityAlpha * gravity[1] + (1f - gravityAlpha) * values[1]
+    gravity[2] = gravityAlpha * gravity[2] + (1f - gravityAlpha) * values[2]
+
+    val lx = values[0] - gravity[0]
+    val ly = values[1] - gravity[1]
+    val lz = values[2] - gravity[2]
+
+    val raw = sqrt((lx * lx + ly * ly + lz * lz).toDouble()).toFloat()
+    val smoothed = motionAlpha * motionMagnitude + (1f - motionAlpha) * raw
+    motionMagnitude = smoothed
+
+    val now = System.currentTimeMillis()
+
+    if (isSteady) {
+      if (smoothed > movingThreshold) {
+        // Upper threshold crossed: measurement stops immediately.
+        isSteady = false
+        motionPeak = smoothed
+        calmSince = 0L
+        onMotionStateChanged(false, smoothed)
+      }
+    } else {
+      if (smoothed > motionPeak) motionPeak = smoothed
+
+      if (smoothed < steadyThreshold) {
+        if (calmSince == 0L) calmSince = now
+        if (now - calmSince >= steadyHoldMs) {
+          // Held below the lower threshold long enough, so resuming is safe.
+          isSteady = true
+          calmSince = 0L
+          onMotionStateChanged(true, smoothed)
+        }
+      } else {
+        // Still moving: restart the hold timer.
+        calmSince = 0L
+      }
+    }
+  }
+
+  /** Fires on every STEADY <-> MOVING transition. Hops to the UI thread to emit. */
+  private fun onMotionStateChanged(steady: Boolean, magnitude: Float) {
+    if (!steady) {
+      // Stop the in-flight measurement: drop any queued tap and invalidate the
+      // candidate so the reticle cannot lock onto a surface while shaking.
+      pendingTap = false
+      candidateValid = false
+      candidatePose = null
+    }
+
+    val peak = motionPeak
+    post {
+      onSteadyChange(
+        mapOf(
+          "steady" to steady,
+          "state" to (if (steady) "STEADY" else "MOVING"),
+          "magnitude" to magnitude,
+          "peakMagnitude" to peak,
+          "movingThreshold" to movingThreshold,
+          "steadyThreshold" to steadyThreshold,
+          "pointsPlaced" to measurementAnchors.size,
+          "sensorAvailable" to motionSensorAvailable
+        )
+      )
+    }
+
+    if (steady) {
+      postStatus("STEADY", "Phone is steady. You can place the next point.")
+    } else {
+      postStatus("MOVING", "Hold the phone steady. Measurement paused.")
+    }
+  }
+
+  /** True when a point may be placed right now. */
+  private fun canMeasure(): Boolean = isSteady || !motionSensorAvailable
+
+  /** Allows JS to tune motion sensitivity without a rebuild. */
+  fun setMotionSensitivity(moving: Float, steady: Float, holdMs: Int) {
+    if (moving > 0f) movingThreshold = moving
+    if (steady > 0f) steadyThreshold = steady
+    if (holdMs > 0) steadyHoldMs = holdMs.toLong()
   }
 
   // ============================================================
@@ -270,6 +507,7 @@ class GraniteARView(
       currentSession.resume()
       sessionRunning = true
       glSurfaceView.onResume()
+      startMotionSensor()
       postStatus("TRACKING", "AR tracking started")
     } catch (_: CameraNotAvailableException) {
       sessionRunning = false
@@ -294,11 +532,15 @@ class GraniteARView(
         session?.resume()
         sessionRunning = true
         glSurfaceView.onResume()
+        startMotionSensor()
       } catch (_: Exception) {}
     }
   }
 
   override fun onDetachedFromWindow() {
+    // Unregister first: an accelerometer callback firing after the GL surface
+    // is torn down would emit events for a view that is on its way out.
+    stopMotionSensor()
     glSurfaceView.onPause()
     try { session?.pause() } catch (_: Exception) {}
     sessionRunning = false
@@ -319,6 +561,14 @@ class GraniteARView(
   private fun processPendingTap(frame: Frame) {
     if (!pendingTap) return
     pendingTap = false
+
+    // Motion gate: refuse to lock a point while the phone is moving. A point
+    // placed mid-motion inherits the tracking error of that instant and
+    // silently corrupts every dimension derived from it.
+    if (!canMeasure()) {
+      postStatus("NOT_STEADY", "Phone is moving. Hold it steady, then place the point.")
+      return
+    }
 
     if (frame.camera.trackingState != TrackingState.TRACKING) {
       postStatus("NO_HIT", "Move phone slowly to scan the block surface first.")
@@ -490,6 +740,12 @@ class GraniteARView(
     labels: List<Map<String, Any>>,
     diagnostics: Map<String, Any?> = emptyMap()
   ) {
+    // Steadiness rides along on every overlay frame (already throttled to
+    // ~30 fps) so the UI can animate a live motion meter without a second
+    // high-rate event stream. Discrete transitions still come via onSteadyChange.
+    val steadyNow = canMeasure()
+    val magnitudeNow = motionMagnitude
+
     post {
       onOverlayUpdate(
         mapOf(
@@ -498,6 +754,10 @@ class GraniteARView(
           "candidateScreenX" to candidateScreenX,
           "candidateScreenY" to candidateScreenY,
           "labels" to labels,
+          "steady" to steadyNow,
+          "motionMagnitude" to magnitudeNow,
+          "movingThreshold" to movingThreshold,
+          "motionSensorAvailable" to motionSensorAvailable,
           "diagnostics" to diagnostics
         )
       )
@@ -600,8 +860,14 @@ class GraniteARView(
         drawCamera(frame)
 
         // 2. Continuous candidate hit-test at SCREEN CENTER only (never touch coords)
-        val centerHits = frame.hitTest(displayWidth / 2.0f, displayHeight / 2.0f)
-        val candidateHit = selectBestHit(centerHits)
+        //    Suppressed entirely while the phone is moving, so the reticle goes
+        //    dim and no preview line is drawn from a pose we do not trust.
+        val steadyNow = canMeasure()
+        val candidateHit = if (steadyNow) {
+          selectBestHit(frame.hitTest(displayWidth / 2.0f, displayHeight / 2.0f))
+        } else {
+          null
+        }
         candidateValid = (candidateHit != null)
         candidatePose = candidateHit?.hitPose
         val localCandidatePose = candidatePose

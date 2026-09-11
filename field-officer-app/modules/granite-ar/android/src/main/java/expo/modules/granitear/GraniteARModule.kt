@@ -27,10 +27,21 @@ class GraniteARModule : Module() {
         }
       }
 
+      // Accelerometer motion-gate tuning, exposed so thresholds can be dialled
+      // in on real hardware without rebuilding the native module.
+      // [0] = moving threshold (m/s2), [1] = steady threshold (m/s2),
+      // [2] = hold time (ms) the phone must stay calm before measuring resumes.
+      Prop("motionSensitivity") { view: GraniteARView, values: FloatArray? ->
+        if (values != null && values.size >= 3) {
+          view.setMotionSensitivity(values[0], values[1], values[2].toInt())
+        }
+      }
+
       Events(
         "onStatus",
         "onPointSelected",
-        "onOverlayUpdate"
+        "onOverlayUpdate",
+        "onSteadyChange"
       )
     }
   }
