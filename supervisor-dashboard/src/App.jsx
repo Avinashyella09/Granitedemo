@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiService, clearApiCache } from './services/api';
+import { apiService, clearApiCache, ApiAuthError } from './services/api';
 import { 
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, 
   Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell 
@@ -8,6 +8,18 @@ import {
 export default function App() {
   // Navigation tabs: 'overview', 'registry', 'officers', 'quarries', 'revenue', 'compliance', 'alerts', 'map'
   const [activeTab, setActiveTab] = useState('overview');
+
+  // --- Supervisor authentication (Phase 5B, session login since Phase 6E) ---
+  // Identity is whatever the BACKEND says it is: the dashboard signs in with a
+  // username and password, the session lives in an HttpOnly cookie the browser
+  // manages, and /api/auth/me/ reports who that session belongs to. The
+  // dashboard never decides its own role, never holds a bearer token, and never
+  // stores the password - it is cleared from state the moment login resolves.
+  const [auth, setAuth] = useState(null);          // { username, role, is_supervisor }
+  const [authError, setAuthError] = useState('');
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginUsername, setLoginUsername] = useState('');
 
   // Core data states
   const [blocks, setBlocks] = useState([]);
@@ -61,9 +73,104 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  // Phase 6B: WHY data is absent, never collapsed into a single empty state.
+  //   'ok'   - the reads succeeded (the data may still be legitimately empty)
+  //   'auth' - the backend refused: supervisor login required
+  //   'error'- the request failed for a non-auth reason
+  const [dataState, setDataState] = useState('ok');
+  // Gate the first load until a stored token has been validated, so a logged-in
+  // supervisor never sees a flash of "login required" from a pre-auth 401 storm.
+  const [authReady, setAuthReady] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  // Same distinction for the per-block audit timeline.
+  const [logsState, setLogsState] = useState('ok');
+
+  // Restore a stored token on load and re-validate it against the backend.
+  // A token that is no longer valid is discarded rather than trusted.
+  // Phase 6E: the session lives in an HttpOnly cookie the browser manages, so
+  // there is nothing stored locally to inspect. Ask the backend who we are - a
+  // valid session restores the signed-in UI, a 401 shows the login form.
   useEffect(() => {
-    loadAllData();
+    apiService.whoAmI()
+      .then((me) => setAuth(me))
+      .catch(() => setAuth(null))
+      .finally(() => setAuthReady(true));
   }, []);
+
+  const handleLogin = async () => {
+    setAuthError('');
+    const username = loginUsername.trim();
+    const password = loginPassword;
+    if (!username || !password) {
+      setAuthError('Username and password are required.');
+      return;
+    }
+    try {
+      const me = await apiService.login(username, password);
+      setAuth(me);
+      setShowLogin(false);
+      clearApiCache();
+    } catch (e) {
+      setAuth(null);
+      setAuthError(e instanceof ApiAuthError ? e.message : `Login failed: ${e.message}`);
+    } finally {
+      // The password is discarded either way - it is never kept in state,
+      // localStorage, sessionStorage or a URL.
+      setLoginPassword('');
+    }
+  };
+
+  const handleLogout = async () => {
+    await apiService.logout();          // ends the Django session server-side
+    setAuth(null);
+    setAuthError('');
+    setShowLogin(false);
+    clearApiCache();
+    // Drop protected data from memory so a signed-out viewer sees nothing.
+    setBlocks([]); setOverviewData(null); setOfficers([]); setQuarries([]);
+    setRevenueData(null); setLeakageData(null); setComplianceData(null);
+    setAlerts([]); setMapData(null); setLogs([]);
+    setSelectedBlock(null); setSelectedBlockId(null);
+  };
+
+  // Phase 6B: the report endpoint requires a token, which a plain <a href>
+  // cannot send. The API client fetches the bytes with the Authorization header
+  // and hands them to the browser as a Blob; the token never enters the URL.
+  const handleDownloadPdf = async () => {
+    if (!selectedBlock || pdfBusy) return;
+
+    setPdfBusy(true);
+    try {
+      await apiService.downloadBlockPdf(selectedBlock.block_id);
+    } catch (e) {
+      if (e instanceof ApiAuthError) {
+        setAuthError(e.message);
+        if (e.status === 401) { setAuth(null); setShowLogin(true); }
+      }
+      alert(e.message);
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+
+  // Shared failure handling for privileged writes.
+  const handlePrivilegedError = (e) => {
+    if (e instanceof ApiAuthError) {
+      setAuthError(e.message);
+      if (e.status === 401) { setAuth(null); setShowLogin(true); }
+      alert(e.message);
+    } else {
+      alert(e.message);
+    }
+  };
+
+  // Reloads on login and on logout: the protected reads return different results
+  // (or 401) depending on authentication, so the view must be refetched, not
+  // left showing whatever the previous state produced.
+  useEffect(() => {
+    if (!authReady) return;
+    loadAllData();
+  }, [authReady, auth?.username]);
 
   const handleManualRefresh = async () => {
     clearApiCache();
@@ -72,17 +179,26 @@ export default function App() {
 
   const loadAllData = async () => {
     setLoading(true);
+    // Phase 6B: a 401 is not "no data". Track which kind of failure occurred so
+    // the UI can say "supervisor login required" rather than rendering zeros.
+    let sawAuthError = false;
+    let sawOtherError = false;
+    const note = (label) => (e) => {
+      if (e instanceof ApiAuthError) sawAuthError = true;
+      else { sawOtherError = true; console.error(`Error loading ${label}:`, e); }
+      return null;
+    };
     try {
       // Fire all streams concurrently and set state progressively as each resolves
-      const pBlocks = apiService.getBlocks().then(data => { setBlocks(data); return data; }).catch(e => { console.error("Error loading blocks:", e); return []; });
-      const pOverview = apiService.getExecutiveOverview().then(data => { setOverviewData(data); return data; }).catch(e => { console.error("Error loading overview:", e); return null; });
-      const pOfficers = apiService.getOfficersAnalytics().then(data => { setOfficers(data); return data; }).catch(e => { console.error("Error loading officers:", e); return []; });
-      const pQuarries = apiService.getQuarriesComparison().then(data => { setQuarries(data); return data; }).catch(e => { console.error("Error loading quarries:", e); return []; });
-      const pRevenue = apiService.getRevenueSummary().then(data => { setRevenueData(data); return data; }).catch(e => { console.error("Error loading revenue:", e); return null; });
-      const pLeakage = apiService.getRevenueLeakage().then(data => { setLeakageData(data); return data; }).catch(e => { console.error("Error loading leakage:", e); return null; });
-      const pCompliance = apiService.getAuditReadiness().then(data => { setComplianceData(data); return data; }).catch(e => { console.error("Error loading audit readiness:", e); return null; });
-      const pAlerts = apiService.getAlerts().then(data => { setAlerts(data); return data; }).catch(e => { console.error("Error loading alerts:", e); return []; });
-      const pMap = apiService.getMapData().then(data => { setMapData(data); return data; }).catch(e => { console.error("Error loading map:", e); return null; });
+      const pBlocks = apiService.getBlocks().then(data => { setBlocks(data); return data; }).catch(note('blocks'));
+      const pOverview = apiService.getExecutiveOverview().then(data => { setOverviewData(data); return data; }).catch(note('overview'));
+      const pOfficers = apiService.getOfficersAnalytics().then(data => { setOfficers(data); return data; }).catch(note('officers'));
+      const pQuarries = apiService.getQuarriesComparison().then(data => { setQuarries(data); return data; }).catch(note('quarries'));
+      const pRevenue = apiService.getRevenueSummary().then(data => { setRevenueData(data); return data; }).catch(note('revenue'));
+      const pLeakage = apiService.getRevenueLeakage().then(data => { setLeakageData(data); return data; }).catch(note('leakage'));
+      const pCompliance = apiService.getAuditReadiness().then(data => { setComplianceData(data); return data; }).catch(note('audit readiness'));
+      const pAlerts = apiService.getAlerts().then(data => { setAlerts(data); return data; }).catch(note('alerts'));
+      const pMap = apiService.getMapData().then(data => { setMapData(data); return data; }).catch(note('map'));
 
       const [blocksData, overview, officersList, quarriesList] = await Promise.all([
         pBlocks, pOverview, pOfficers, pQuarries, pRevenue, pLeakage, pCompliance, pAlerts, pMap
@@ -117,8 +233,12 @@ export default function App() {
           .catch(e => console.error("Error loading quarry A trend:", e));
       }
 
+      if (sawAuthError) setDataState('auth');
+      else if (sawOtherError) setDataState('error');
+      else setDataState('ok');
     } catch (e) {
       console.error("Failed to load dashboard data: ", e);
+      setDataState(e instanceof ApiAuthError ? 'auth' : 'error');
     } finally {
       setLoading(false);
     }
@@ -144,7 +264,11 @@ export default function App() {
     try {
       const auditData = await apiService.getAuditLogs(blockId);
       setLogs(auditData);
+      setLogsState('ok');
     } catch (e) {
+      // An empty timeline and a refused request are different facts.
+      setLogs([]);
+      setLogsState(e instanceof ApiAuthError ? 'auth' : 'error');
       console.error(e);
     }
   };
@@ -167,6 +291,16 @@ export default function App() {
         setAssSnapshot(null);
       }
     } catch (e) {
+      if (e instanceof ApiAuthError) {
+        setAssWeight('Login required');
+        setAssRate('Login required');
+        setAssSeig('Login required');
+      } else {
+        setAssWeight('Unavailable');
+        setAssRate('Unavailable');
+        setAssSeig('Unavailable');
+      }
+      setAssSnapshot(null);
       console.error(e);
     }
   };
@@ -202,20 +336,32 @@ export default function App() {
       }
     }
 
-    const officerName = prompt("Enter Supervisor Name/ID to sign action log:", ovActor);
-    if (!officerName) return;
+    // No name prompt. The backend records the AUTHENTICATED user as the actor;
+    // a typed-in name was never proof of anything and is no longer sent.
+    if (!auth?.is_supervisor) {
+      setShowLogin(true);
+      alert('Supervisor login required for this action.');
+      return;
+    }
 
     try {
-      await apiService.approveBlock(selectedBlockId, {
+      const result = await apiService.approveBlock(selectedBlockId, {
         approval_status: statusVal,
-        actor: officerName,
         reason: reason
       });
-      alert(`Block marked as ${statusVal.toUpperCase()}`);
+      // Phase 6G: re-sending a decision the block already carries is a no-op
+      // server-side, not a failure and not a new decision. Say so plainly.
+      if (result && typeof result.code === 'string' && result.code.startsWith('already_')) {
+        alert(`Already ${statusVal}.\n\nNo new decision was recorded - this block was ` +
+              `already ${statusVal}` +
+              (result.approved_by ? ` by ${result.approved_by}.` : '.'));
+      } else {
+        alert(`Block marked as ${statusVal.toUpperCase()}`);
+      }
       await loadAllData();
       await handleSelectBlock(selectedBlockId);
     } catch (e) {
-      alert(e.message);
+      handlePrivilegedError(e);
     }
   };
 
@@ -233,13 +379,18 @@ export default function App() {
       return;
     }
 
+    if (!auth?.is_supervisor) {
+      setShowLogin(true);
+      alert('Supervisor login required for this action.');
+      return;
+    }
+
     try {
       await apiService.overrideBlock(selectedBlockId, {
         length_m: len,
         breadth_m: brd,
         height_m: hgt,
-        reason: ovReason,
-        actor: ovActor
+        reason: ovReason
       });
       alert("Manual override applied and saved successfully.");
       setOvReason('');
@@ -301,7 +452,7 @@ export default function App() {
       csvContent += `"Total Blocks Checked",${revenueData?.block_count}\n`;
       csvContent += `"Gangsaw Billing","INR ${revenueData?.gangsaw_revenue?.toLocaleString()}"\n`;
       csvContent += `"Below Gangsaw Billing","INR ${revenueData?.below_gangsaw_revenue?.toLocaleString()}"\n`;
-      csvContent += `"Estimated Recovery Saved","INR ${leakageData?.estimated_revenue_recovered?.toLocaleString()}"\n`;
+      csvContent += `"Estimated Recovery Saved","${leakageData?.available === false ? 'Not available - no weighbridge data' : 'INR ' + (leakageData?.estimated_revenue_recovered?.toLocaleString() ?? '')}"\n`;
     }
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
@@ -327,7 +478,7 @@ export default function App() {
     <div style={{ fontFamily: 'Inter, sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100vh' }}>
       
       {/* portal header branding */}
-      <header className="portal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 2rem', background: '#fff', boxShadow: '0 1px 3px 0 rgba(0,0,0,0.1)' }}>
+      <header className="portal-header" style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 2rem', background: '#fff', boxShadow: '0 1px 3px 0 rgba(0,0,0,0.1)' }}>
         <div className="header-brand" style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
           <div className="gov-seal" style={{ flexShrink: 0 }}>
             <img src="/ap_govt_logo.svg" alt="Andhra Pradesh State Seal Logo" style={{ height: '60px', width: 'auto', display: 'block' }} />
@@ -338,6 +489,61 @@ export default function App() {
           </div>
         </div>
         
+        {/* Supervisor authentication. Small, header-resident, no redesign.
+            Reads stay anonymous by design; this only unlocks approve/override. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: 'auto', marginRight: '1rem' }}>
+          {auth ? (
+            <>
+              <span style={{ fontSize: '0.8rem', color: '#334155' }}>
+                <strong>{auth.username}</strong>
+                <span style={{
+                  marginLeft: '0.4rem', padding: '0.1rem 0.4rem', borderRadius: '999px',
+                  fontSize: '0.7rem', fontWeight: 700,
+                  background: auth.is_supervisor ? '#dcfce7' : '#e2e8f0',
+                  color: auth.is_supervisor ? '#166534' : '#475569',
+                }}>{auth.role || 'NO ROLE'}</span>
+              </span>
+              <button onClick={handleLogout} className="btn btn-outline" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}>Logout</button>
+            </>
+          ) : (
+            <button onClick={() => setShowLogin((v) => !v)} className="btn btn-outline" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}>
+              Supervisor Login
+            </button>
+          )}
+        </div>
+
+        {showLogin && !auth && (
+          <div style={{
+            position: 'absolute', top: '84px', right: '2rem', zIndex: 100,
+            background: '#fff', border: '1px solid #cbd5e1', borderRadius: '8px',
+            padding: '1rem', boxShadow: '0 6px 18px rgba(0,0,0,0.12)', width: '320px',
+          }}>
+            <h4 style={{ margin: '0 0 0.5rem 0', fontSize: '0.9rem', color: '#1e3a8a' }}>Supervisor Login</h4>
+            <p style={{ margin: '0 0 0.6rem 0', fontSize: '0.72rem', color: '#64748b' }}>
+              Approve and override are recorded against your authenticated identity.
+            </p>
+            <input
+              type="text" placeholder="Username" autoComplete="username"
+              value={loginUsername} onChange={(e) => setLoginUsername(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
+              style={{ width: '100%', marginBottom: '0.4rem', padding: '0.35rem', fontSize: '0.8rem' }}
+            />
+            <input
+              type="password" placeholder="Password" autoComplete="current-password"
+              value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
+              style={{ width: '100%', marginBottom: '0.5rem', padding: '0.35rem', fontSize: '0.8rem' }}
+            />
+            {authError && (
+              <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.75rem', color: '#b91c1c' }}>{authError}</p>
+            )}
+            <div style={{ display: 'flex', gap: '0.4rem' }}>
+              <button onClick={handleLogin} className="btn btn-primary" style={{ padding: '0.3rem 0.7rem', fontSize: '0.78rem' }}>Login</button>
+              <button onClick={() => { setShowLogin(false); setAuthError(''); setLoginPassword(''); }} className="btn btn-outline" style={{ padding: '0.3rem 0.7rem', fontSize: '0.78rem' }}>Cancel</button>
+            </div>
+          </div>
+        )}
+
         {/* Navigation panel */}
         <nav style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
           <button onClick={() => setActiveTab('overview')} className={`nav-btn ${activeTab === 'overview' ? 'active' : ''}`}>Overview</button>
@@ -350,6 +556,40 @@ export default function App() {
           <button onClick={() => setActiveTab('map')} className={`nav-btn ${activeTab === 'map' ? 'active' : ''}`}>Geospatial Map</button>
         </nav>
       </header>
+
+      {/* Phase 6B: why data is missing, stated explicitly.
+          The three cases are kept distinct on purpose - a reader must never be
+          shown an empty dashboard or a zero total when the real reason is that
+          the backend refused the request. */}
+      {!loading && dataState === 'auth' && (
+        <div style={{
+          margin: '1rem 2rem 0', padding: '0.9rem 1.1rem', borderRadius: '8px',
+          background: '#fef9c3', border: '1px solid #facc15', color: '#713f12',
+        }}>
+          <strong>Supervisor login required.</strong>{' '}
+          Block records, assessments, audit trails and revenue analytics are protected
+          and were not loaded. No figures are shown for this data rather than zeros.
+          <button
+            onClick={() => { setShowLogin(true); setAuthError(''); }}
+            className="btn btn-primary"
+            style={{ marginLeft: '0.8rem', padding: '0.25rem 0.7rem', fontSize: '0.78rem' }}
+          >Login</button>
+        </div>
+      )}
+      {!loading && dataState === 'error' && (
+        <div style={{
+          margin: '1rem 2rem 0', padding: '0.9rem 1.1rem', borderRadius: '8px',
+          background: '#fee2e2', border: '1px solid #f87171', color: '#7f1d1d',
+        }}>
+          <strong>Unable to load data.</strong>{' '}
+          One or more requests to the backend failed. The values below may be
+          incomplete - they are not a confirmed zero.
+          <button
+            onClick={handleManualRefresh} className="btn btn-outline"
+            style={{ marginLeft: '0.8rem', padding: '0.25rem 0.7rem', fontSize: '0.78rem' }}
+          >Retry</button>
+        </div>
+      )}
 
       {/* Hero Banner Section - ONLY on Overview page */}
       {activeTab === 'overview' && (
@@ -816,9 +1056,9 @@ export default function App() {
                       <p><strong>Inspector ID:</strong> {selectedBlock.inspecting_officer_id || 'N/A'}</p>
                     </div>
                     <div>
-                      <p><strong>Lighting Condition:</strong> {selectedBlock.lighting_condition || 'Sunny'}</p>
+                      <p><strong>Lighting Condition:</strong> {selectedBlock.lighting_condition || 'Not recorded'}</p>
                       <p><strong>Capture Attempts:</strong> {selectedBlock.capture_attempt_count || 1}</p>
-                      <p><strong>Device ID:</strong> {selectedBlock.device_id || 'DEV-N/A'}</p>
+                      <p><strong>Device ID:</strong> {selectedBlock.device_id || 'Not recorded'}</p>
                       <p><strong>Supervisor Approved By:</strong> {selectedBlock.approved_by || 'Unreviewed'}</p>
                       <p><strong>Approved Time:</strong> {selectedBlock.approved_at ? new Date(selectedBlock.approved_at).toLocaleString() : 'N/A'}</p>
                     </div>
@@ -866,22 +1106,18 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Visual assets overlay */}
+                  {/* Field image.
+                      The CV Annotations box was removed: these blocks are
+                      measured with AR and carry cv_status 'not_applicable', so
+                      annotated_image_path is always null and the box rendered
+                      nothing but a broken-image placeholder. */}
                   <div className="media-preview-container">
                     <div className="media-box">
-                      <div className="metric-label" style={{ position: 'absolute', top: 5, left: 5, background: 'rgba(0,0,0,0.6)', color: 'white', padding: '0.1rem 0.4rem', borderRadius: 4, zIndex: 5 }}>Raw Photo</div>
-                      <img 
-                        src={selectedBlock.raw_image_path ? (selectedBlock.raw_image_path.startsWith('/') ? selectedBlock.raw_image_path : `/media/${selectedBlock.raw_image_path}`) : "/Test-images/1.jpeg"} 
-                        alt="Original" 
-                        onError={(e) => { e.target.onerror = null; e.target.src = "/Test-images/1.jpeg"; }} 
-                      />
-                    </div>
-                    <div className="media-box">
-                      <div className="metric-label" style={{ position: 'absolute', top: 5, left: 5, background: 'rgba(30,58,138,0.8)', color: 'white', padding: '0.1rem 0.4rem', borderRadius: 4, zIndex: 5 }}>CV Annotations</div>
-                      <img 
-                        src={selectedBlock.annotated_image_path ? (selectedBlock.annotated_image_path.startsWith('/') ? selectedBlock.annotated_image_path : `/media/${selectedBlock.annotated_image_path}`) : "/Test-images/2.jpeg"} 
-                        alt="Annotated" 
-                        onError={(e) => { e.target.onerror = null; e.target.src = "/Test-images/2.jpeg"; }} 
+                      <div className="metric-label" style={{ position: 'absolute', top: 5, left: 5, background: 'rgba(0,0,0,0.6)', color: 'white', padding: '0.1rem 0.4rem', borderRadius: 4, zIndex: 5 }}>Field Image</div>
+                      <img
+                        src={selectedBlock.raw_image_path ? (selectedBlock.raw_image_path.startsWith('/') ? selectedBlock.raw_image_path : `/media/${selectedBlock.raw_image_path}`) : ""}
+                        alt="Field capture"
+                        onError={(e) => { e.target.onerror = null; e.target.style.display = 'none'; e.target.insertAdjacentHTML('afterend', '<p style="color:#94a3b8;font-size:0.8rem;padding:1rem">No image available</p>'); }}
                       />
                     </div>
                   </div>
@@ -891,7 +1127,22 @@ export default function App() {
                     <button className="btn btn-success" onClick={() => handleApprove('approved')}>Approve Sizing</button>
                     <button className="btn btn-danger" onClick={() => handleApprove('rejected')}>Reject Block</button>
                     <button className="btn btn-secondary" onClick={() => setShowOverride(!showOverride)}>Override Sizing</button>
-                    <a href={`/api/blocks/${selectedBlock.block_id}/pdf/`} target="_blank" className="btn btn-outline">🖨 Export PDF</a>
+                    {/* Every registered block exports. Without an assessment the
+                        backend returns a MEASUREMENT RECORD whose financial fields
+                        read "Not assessed", so the label says which document the
+                        officer is about to get rather than blocking the click. */}
+                    <button
+                      onClick={handleDownloadPdf}
+                      disabled={pdfBusy}
+                      title={assSnapshot
+                        ? 'Download the seigniorage assessment report'
+                        : 'This block has not been assessed yet - the export will be a measurement record with no payable amount.'}
+                      className="btn btn-outline"
+                    >
+                      {pdfBusy
+                        ? '⏳ Preparing PDF...'
+                        : (assSnapshot ? '🖨 Export PDF' : '🖨 Export Measurement Record')}
+                    </button>
                   </div>
 
                   {showOverride && (
@@ -963,6 +1214,22 @@ export default function App() {
                   <div style={{ marginTop: '1.5rem' }}>
                     <h4 className="card-title" style={{ fontSize: '0.95rem' }}>Block Transaction Timelines</h4>
                     <div className="timeline">
+                      {/* Phase 6B: three distinct outcomes, never one blank list. */}
+                      {logsState === 'auth' && (
+                        <p style={{ color: '#713f12', fontSize: '0.82rem' }}>
+                          Supervisor login required to view the audit trail.
+                        </p>
+                      )}
+                      {logsState === 'error' && (
+                        <p style={{ color: '#7f1d1d', fontSize: '0.82rem' }}>
+                          Unable to load the audit trail.
+                        </p>
+                      )}
+                      {logsState === 'ok' && logs.length === 0 && (
+                        <p style={{ color: '#64748b', fontSize: '0.82rem' }}>
+                          No audit records available for this block.
+                        </p>
+                      )}
                       {logs.map((log, id) => (
                         <div key={id} className="timeline-item">
                           <div className="timeline-time">{log.timestamp}</div>
@@ -1244,13 +1511,17 @@ export default function App() {
                 <div className="card" style={{ borderLeft: '4px solid #8b5cf6', background: '#faf5ff' }}>
                   <div className="card-title" style={{ color: '#6b21a8' }}>AI Sizing Revenue Recovery Estimate</div>
                   <div style={{ fontSize: '2rem', fontWeight: 900, color: '#6b21a8', marginBottom: '0.5rem' }}>
-                    INR {leakageData?.estimated_revenue_recovered?.toLocaleString()}
+                    {leakageData?.available === false
+                      ? 'Not available'
+                      : `INR ${leakageData?.estimated_revenue_recovered?.toLocaleString() ?? '—'}`}
                   </div>
                   <p style={{ fontSize: '0.85rem', color: '#581c87', lineHeight: 1.5 }}>
                     This estimation shows the recovered geological billing fees saved from under-reported sizing returns. Calculations scale volume discrepancy variance by verified block rates.
                   </p>
                   <div style={{ background: '#f3e8ff', padding: '0.75rem', borderRadius: '6px', fontSize: '0.8rem', color: '#581c87', marginTop: '1rem', border: '1px solid #d8b4fe' }}>
-                    <strong>Average block variance detected:</strong> {leakageData?.average_leakage_pct}% discrepancies out of weighbridge estimates.
+                    {leakageData?.available === false
+                      ? leakageData?.message
+                      : <><strong>Average block variance detected:</strong> {leakageData?.average_leakage_pct}% against recorded weighbridge weights.</>}
                   </div>
                 </div>
               </div>
@@ -1359,7 +1630,7 @@ export default function App() {
                       <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.85rem', color: '#475569' }}>{alert.description}</p>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem', color: '#64748b' }}>
                         <span>Target: <strong>{alert.related_entity}</strong></span>
-                        <button onClick={() => { setActiveTab('registry'); handleSelectBlock(alert.related_entity.split(':').pop().strip()); }} className="btn btn-outline" style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}>Inspect Block</button>
+                        <button onClick={() => { setActiveTab('registry'); handleSelectBlock(alert.related_entity.split(':').pop().trim()); }} className="btn btn-outline" style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}>Inspect Block</button>
                       </div>
                     </div>
                   ))}
@@ -1375,7 +1646,7 @@ export default function App() {
             <div className="disclaimer-alert">
               <span className="disclaimer-icon">🌐</span>
               <div>
-                <strong>Map Coordinate labels:</strong> Visualized locations represent synthetic demo coords inside Prakasam, Nellore, and Chittoor districts bounding box ranges.
+                <strong>Map coordinates:</strong> Every block marker is plotted from the GPS position recorded by the field officer at capture time. Quarry pins are plotted from the registered quarry location. Blocks captured without a GPS fix are counted separately and never placed on the map.
               </div>
             </div>
 
@@ -1390,7 +1661,10 @@ export default function App() {
                 
                 {/* Coordinate axis labels */}
                 <div style={{ position: 'absolute', bottom: 10, left: 10, background: 'rgba(255,255,255,0.8)', padding: '0.2rem 0.5rem', borderRadius: 4, fontSize: '0.7rem', color: '#64748b' }}>
-                  Demo AP Bounding Box: 14.0°N - 16.5°N | 78.5°E - 80.5°E
+                  AP Bounding Box: 14.0°N - 16.5°N | 78.5°E - 80.5°E
+                  {'  '}|{'  '}
+                  {blocks.filter(b => b.gps_latitude != null && b.gps_longitude != null).length} block(s) plotted,
+                  {' '}{blocks.filter(b => b.gps_latitude == null || b.gps_longitude == null).length} without GPS (not plotted)
                 </div>
 
                 {/* State outline overlay labels */}
@@ -1398,11 +1672,15 @@ export default function App() {
                   Andhra Pradesh
                 </div>
 
-                {/* Render coordinates points */}
-                {mapData?.quarries?.map((q, idx) => {
-                  // Normalize coordinates to map percentage boundaries
-                  const topPct = 100 - ((q.latitude - 14.0) / (16.5 - 14.0) * 100);
-                  const leftPct = (q.longitude - 78.5) / (80.5 - 78.5) * 100;
+                {/* Real block GPS only.
+                    Previously this plotted mapData.quarries, whose coordinates the
+                    backend fabricated from an MD5 hash of the quarry id when the
+                    free-text location failed to parse - which it always did. Every
+                    pin was therefore synthetic. Blocks without a GPS fix are counted
+                    below rather than placed at an invented location. */}
+                {blocks.filter(b => b.gps_latitude != null && b.gps_longitude != null).map((q, idx) => {
+                  const topPct = 100 - ((q.gps_latitude - 14.0) / (16.5 - 14.0) * 100);
+                  const leftPct = (q.gps_longitude - 78.5) / (80.5 - 78.5) * 100;
 
                   return (
                     <div 
@@ -1423,7 +1701,7 @@ export default function App() {
                       
                       {/* Name tags */}
                       <div style={{ position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15,23,42,0.85)', color: 'white', padding: '0.15rem 0.35rem', borderRadius: 4, fontSize: '0.65rem', whiteSpace: 'nowrap', marginTop: 4 }}>
-                        {q.name.split('-').pop()}
+                        {q.block_id}
                       </div>
                     </div>
                   );
@@ -1432,19 +1710,30 @@ export default function App() {
 
               {/* Sidebar coordinates list items */}
               <div style={{ maxHeight: 480, overflowY: 'auto' }}>
-                <h4 style={{ margin: '0 0 1rem 0', color: '#1e3a8a' }}>Inspected Quarry Details</h4>
+                <h4 style={{ margin: '0 0 1rem 0', color: '#1e3a8a' }}>Captured Locations</h4>
+                {/* Real recorded coordinates only. A block with no GPS fix is
+                    reported as a count, never placed at an inferred location. */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                  {mapData?.quarries?.map((q, idx) => (
+                  {(mapData?.blocks ?? []).map((b, idx) => (
                     <div key={idx} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '0.75rem' }}>
-                      <h5 style={{ margin: '0 0 0.25rem 0', color: '#1e3a8a', fontSize: '0.85rem' }}>{q.name}</h5>
+                      <h5 style={{ margin: '0 0 0.25rem 0', color: '#1e3a8a', fontSize: '0.85rem' }}>{b.block_id}</h5>
                       <div style={{ fontSize: '0.75rem', color: '#475569' }}>
-                        <p style={{ margin: '0.15rem 0' }}>📍 District: <strong>{q.district}</strong></p>
-                        <p style={{ margin: '0.15rem 0' }}>🌐 Coords: <strong>{q.latitude.toFixed(4)}°N, {q.longitude.toFixed(4)}°E</strong></p>
-                        <p style={{ margin: '0.15rem 0' }}>🧱 Inspected Blocks: <strong>{q.block_count}</strong></p>
-                        <p style={{ margin: '0.15rem 0' }}>💰 Indicative Revenue: <strong>INR {q.revenue.toLocaleString()}</strong></p>
+                        <p style={{ margin: '0.15rem 0' }}>Coords: <strong>{b.latitude.toFixed(6)}&deg;N, {b.longitude.toFixed(6)}&deg;E</strong></p>
+                        <p style={{ margin: '0.15rem 0' }}>Quarry (submitted): <strong>{b.submitted_quarry_id || 'Not recorded'}</strong></p>
+                        <p style={{ margin: '0.15rem 0' }}>Officer: <strong>{b.officer_id || 'Not recorded'}</strong></p>
+                        <p style={{ margin: '0.15rem 0' }}>Approval: <strong>{(b.approval_status || 'pending').toUpperCase()}</strong></p>
+                        <p style={{ margin: '0.15rem 0' }}>Seigniorage: <strong>{b.seigniorage != null ? `INR ${b.seigniorage.toLocaleString()}` : 'Not assessed'}</strong></p>
                       </div>
                     </div>
                   ))}
+                  {(mapData?.blocks ?? []).length === 0 && (
+                    <p style={{ color: '#64748b', fontSize: '0.8rem' }}>No block has a recorded GPS fix yet.</p>
+                  )}
+                  {mapData?.blocks_without_gps > 0 && (
+                    <p style={{ color: '#64748b', fontSize: '0.75rem' }}>
+                      {mapData.blocks_without_gps} block(s) have no GPS fix and are not plotted.
+                    </p>
+                  )}
                 </div>
               </div>
 

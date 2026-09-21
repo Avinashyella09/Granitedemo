@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
     'blocks',
 ]
@@ -77,6 +78,22 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+# Phase 6E: the Supervisor Dashboard authenticates with a Django SESSION, so
+# unsafe requests carry a CSRF token. Vite proxies /api to this backend, so the
+# browser treats the calls as same-origin (localhost:5173) - but the proxy
+# forwards the original Origin header while the Host becomes 127.0.0.1:8000, and
+# Django rejects that mismatch unless the dev origin is trusted explicitly.
+#
+# This is the narrow, documented fix. CSRF is NOT disabled, no view is exempted,
+# and the login endpoint is explicitly csrf_protect'ed. Local dev origins only -
+# these must be replaced with the real origin before any deployment.
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
 ]
 
 CORS_ALLOW_ALL_ORIGINS = True
@@ -169,3 +186,19 @@ if parent_dir not in sys.path:
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+
+
+# --- DRF authentication (Phase 5A) -------------------------------------------
+# Default stays AllowAny so the existing read-only dashboard and the frozen iOS
+# field app keep working unchanged. Privileged governance writes opt IN to
+# IsSupervisor individually (blocks/permissions.py) rather than locking the whole
+# API, which would break both clients at once.
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+}

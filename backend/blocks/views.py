@@ -2,6 +2,11 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Block, Quarry, Measurement
+from .permissions import IsSupervisor
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from django.contrib.auth import authenticate, login as django_login, logout as django_logout
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from .serializers import BlockSerializer
 import datetime
 import os
@@ -60,43 +65,90 @@ def _get_all_audit_logs():
     from .models import AuditLog
     return _get_cached('all_audit_logs', lambda: list(AuditLog.objects.all().select_related(max_depth=1)))
 
+def block_to_dict(block):
+    """Single source of truth for the Block API shape.
+
+    This exists because the same dict was previously hand-built in six places
+    and had already drifted apart - and, critically, every copy omitted the
+    approval/override fields. BlockSerializer declares those read_only, and DRF
+    raises SkipField for a read_only field missing from the source object, so
+    they were silently absent from every response. The dashboard therefore
+    showed every block as "pending", its approval filter matched nothing, and
+    the "Original CV Estimates (Preserved)" override panel could never render -
+    an audit-trail gap, not a cosmetic one.
+    """
+    def measurement_dict(m):
+        if not m:
+            return None
+        return {
+            "length_m": m.length_m,
+            "breadth_m": m.breadth_m,
+            "height_m": m.height_m,
+            "volume_m3": m.volume_m3,
+            "confidence": m.confidence,
+            "measurement_method": m.measurement_method,
+            "measured_at": m.measured_at,
+        }
+
+    return {
+        "id": str(block.id),
+        "block_id": block.block_id,
+        "quarry_id": str(block.quarry.id) if block.quarry else None,
+        "image_paths": block.image_paths,
+        "captured_at": block.captured_at,
+        "gps_latitude": block.gps_latitude,
+        "gps_longitude": block.gps_longitude,
+        "status": block.status,
+        "measurement": measurement_dict(block.measurement),
+        "cv_status": block.cv_status,
+        "cv_error_message": block.cv_error_message,
+        "raw_image_path": block.raw_image_path,
+        "annotated_image_path": block.annotated_image_path,
+        "created_at": block.created_at,
+        "updated_at": block.updated_at,
+        # --- previously dropped by SkipField ---
+        "is_overridden": block.is_overridden,
+        "original_measurement": measurement_dict(block.original_measurement),
+        "override_reason": block.override_reason,
+        "approval_status": block.approval_status,
+        "approved_by": block.approved_by,
+        "approved_at": block.approved_at,
+        # --- real capture metadata, so the UI stops using hardcoded fallbacks ---
+        "inspecting_officer_id": block.inspecting_officer_id,
+        "submitted_quarry_id": block.submitted_quarry_id,
+        "reference_warnings": list(block.reference_warnings or []),
+        "device_id": block.device_id,
+        "lighting_condition": block.lighting_condition,
+        "capture_attempt_count": block.capture_attempt_count,
+    }
+
 class BlockListCreateAPIView(APIView):
     """
     API View to list all blocks or create a new block.
+
+    Phase 6B: permissions are per METHOD, not per class, and that is deliberate.
+
+    GET returns the whole block register - dimensions, approval state, image
+    paths - so it requires authentication. POST is called by the FROZEN iOS
+    field app (App.js -> apiService.createBlock) on its CV measurement path.
+    The frozen app has no authentication contract and must keep working
+    unchanged, so POST stays anonymous in this step. A class-level
+    permission_classes would have closed the read hole and broken the field app
+    at the same time.
     """
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated()]
+        # POST: FIELD-APP AUTHENTICATION PENDING (deliberate PoC exception).
+        # The frozen iOS app calls this on its CV measurement path and sends
+        # no credential. See BlockARMeasureAPIView for the full rationale.
+        return [AllowAny()]
+
     def get(self, request):
         def _fetch_serialized_blocks():
             blocks = list(Block.objects.all().select_related(max_depth=1))
-            serialized_data = []
-            for block in blocks:
-                data = {
-                    "id": str(block.id),
-                    "block_id": block.block_id,
-                    "quarry_id": str(block.quarry.id) if block.quarry else None,
-                    "image_paths": block.image_paths,
-                    "captured_at": block.captured_at,
-                    "gps_latitude": block.gps_latitude,
-                    "gps_longitude": block.gps_longitude,
-                    "status": block.status,
-                    "measurement": {
-                        "length_m": block.measurement.length_m,
-                        "breadth_m": block.measurement.breadth_m,
-                        "height_m": block.measurement.height_m,
-                        "volume_m3": block.measurement.volume_m3,
-                        "confidence": block.measurement.confidence,
-                        "measurement_method": block.measurement.measurement_method,
-                        "measured_at": block.measurement.measured_at,
-                    } if block.measurement else None,
-                    "cv_status": block.cv_status,
-                    "cv_error_message": block.cv_error_message,
-                    "raw_image_path": block.raw_image_path,
-                    "annotated_image_path": block.annotated_image_path,
-                    "created_at": block.created_at,
-                    "updated_at": block.updated_at,
-                }
-                serializer = BlockSerializer(data)
-                serialized_data.append(serializer.data)
-            return serialized_data
+            return [BlockSerializer(block_to_dict(b)).data for b in blocks]
 
         data = _get_cached('blocks_json', _fetch_serialized_blocks)
         return Response(data, status=status.HTTP_200_OK)
@@ -193,6 +245,10 @@ class BlockListCreateAPIView(APIView):
 
 
 class BlockDetailAPIView(APIView):
+    # Phase 6B read-surface authentication. Block detail exposes measurements and approval state.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     API View to retrieve a single block by block_id.
     """
@@ -240,7 +296,33 @@ from .services import generate_assessment_report
 class AssessmentListCreateAPIView(APIView):
     """
     API View to list all assessments or create a new assessment.
+
+    Phase 6B: GET requires authentication - the list carries rate, tonnage and
+    the payable amount for every block.
+
+    Phase 6C: POST now requires authentication too. Creating an Assessment is
+    the money-determining action in this system - it fixes the tonnage, the
+    official rate and the payable seigniorage for a block - so it must be
+    attributable to a real identity. It was the last anonymous financial write.
+
+    IsAuthenticated rather than IsSupervisor, deliberately: the business model
+    gates DECISIONS (approve / reject / override) on the supervisor role, while
+    running the official calculation is a routine step an inspecting officer
+    performs. The figures are server-derived either way, and the supervisor's
+    approval remains the control that makes an assessment count. Requiring
+    SUPERVISOR here would gate a calculation, not a decision, and would break
+    the officer workflow for no security gain.
+
+    No client may influence the money: rate, amount, volume and tonnage are
+    read_only on the serializer, and the classification a client sends is
+    recorded then discarded in favour of the official rule.
     """
+
+    def get_permissions(self):
+        # Both methods now require authentication; kept as get_permissions so the
+        # GET/POST distinction stays visible if the two ever diverge again.
+        return [IsAuthenticated()]
+
     def get(self, request):
         assessments = Assessment.objects.all()
         serialized_data = []
@@ -270,7 +352,7 @@ class AssessmentListCreateAPIView(APIView):
         validated_data = serializer.validated_data
         block_id = validated_data['block_id']
         category = validated_data['granite_category']
-        classification = validated_data['gangsaw_classification']
+        classification = validated_data.get('gangsaw_classification')
         density = validated_data.get('density')
         
         # 1. Resolve Block document
@@ -295,39 +377,82 @@ class AssessmentListCreateAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # 4. Run calculation service using existing Phase 2 layer
+        # 4. OFFICIAL calculation - server authoritative.
+        #
+        # The client's gangsaw_classification is accepted for request-shape
+        # compatibility and then DISCARDED: classification is derived from the
+        # stored dimensions by the official > 270cm x 150cm rule. Rate and
+        # amount were already read_only on the serializer and remain so.
+        # Density keeps the existing contract (client may supply one, else the
+        # project default) - see blocks/config.DEFAULT_DENSITY_MT_PER_M3.
+        from . import seigniorage
+        from .config import DEFAULT_DENSITY_MT_PER_M3
+
+        effective_density = density if density is not None else DEFAULT_DENSITY_MT_PER_M3
         try:
-            report = generate_assessment_report(
-                block_id=block_id,
+            result = seigniorage.calculate(
                 length_m=block_doc.measurement.length_m,
                 breadth_m=block_doc.measurement.breadth_m,
                 height_m=block_doc.measurement.height_m,
-                category=category,
-                classification=classification,
-                density=density
+                granite_category=category,
+                density_mt_per_m3=effective_density,
             )
-        except ValueError as e:
+        except seigniorage.SeigniorageError as e:
             return Response(
-                {"error": f"Calculation error: {e}"},
+                {"granite_category": [str(e)]},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # 5. Persist the Assessment document (storing the exact snapshot values)
+        client_classification = (classification or "").strip()
+        server_classification = result["gangsaw_classification"]
+
+        # 5. Persist the Assessment from the SERVER-derived values only.
         ass = Assessment(
             block=block_doc,
-            granite_category=category,
-            gangsaw_classification=classification,
-            volume_m3=report['volume_m3'],
-            weight_mt=report['estimated_weight_mt'],
-            rate_per_mt=report['applicable_rate_per_mt'],
-            indicative_seigniorage=report['indicative_seigniorage'],
-            density_mt_per_m3=report['density_mt_per_m3'],
+            granite_category=result["granite_category"],
+            gangsaw_classification=server_classification,
+            volume_m3=result["volume_m3"],
+            weight_mt=result["tonnage_mt"],
+            rate_per_mt=result["rate_per_mt"],
+            indicative_seigniorage=result["seigniorage_amount"],
+            density_mt_per_m3=result["density_mt_per_m3"],
             status=validated_data.get('status', 'draft')
         )
         ass.save()
         _invalidate_cache()
 
-        # Build clean response output
+        # 6. Audit - the assessment is the money-determining action and was
+        # previously unaudited entirely.
+        AuditLog(
+            block=block_doc,
+            block_id_snapshot=block_doc.block_id,
+            action='seigniorage_assessed',
+            # Phase 6C: POST requires IsAuthenticated, so request.user is always
+            # a real authenticated identity here and the previous anonymous
+            # 'System' fallback is unreachable - removed rather than left as dead
+            # code that implies an anonymous write is still possible.
+            #
+            # The actor comes ONLY from the authenticated session. An 'actor'
+            # field in the request body cannot influence it: AssessmentSerializer
+            # declares no such field, and this view never reads one.
+            actor=request.user.get_username(),
+            details=(
+                f"Official seigniorage: block_id={block_id}, "
+                f"volume={result['volume_m3']}m3, "
+                f"density={result['density_mt_per_m3']}MT/m3, "
+                f"tonnage={result['tonnage_mt']}MT, "
+                f"category={result['granite_category']}, "
+                f"classification={server_classification}, "
+                f"rate={result['rate_per_mt']}INR/MT, "
+                f"amount={result['seigniorage_amount']}INR, "
+                f"schedule={result['rate_schedule_version']}, "
+                f"client_classification={client_classification or 'none'}"
+                + ("" if client_classification in ("", server_classification)
+                   else " (client value ignored; server-derived used)")
+            ),
+            timestamp=datetime.datetime.utcnow(),
+        ).save()
+
         output_data = {
             "id": str(ass.id),
             "block_id": block_id,
@@ -341,12 +466,24 @@ class AssessmentListCreateAPIView(APIView):
             "status": ass.status,
             "created_at": ass.created_at
         }
-        
+
         response_serializer = AssessmentSerializer(output_data)
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        payload = dict(response_serializer.data)
+        payload.update({
+            "tonnage_mt": result["tonnage_mt"],
+            "seigniorage_amount": result["seigniorage_amount"],
+            "rate_schedule_version": result["rate_schedule_version"],
+            "is_official": True,
+            "classification_source": "server",
+        })
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class AssessmentDetailAPIView(APIView):
+    # Phase 6B read-surface authentication. Assessment detail exposes rate, tonnage and payable amount.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     API View to retrieve assessment details for a specific block_id.
     """
@@ -390,6 +527,19 @@ from .serializers import ImageUploadSerializer
 class BlockMeasureCVAPIView(APIView):
     """
     POST: Uploads block image, runs CV pipeline, saves measurement results to Block.
+
+    SECURITY - FIELD-APP AUTHENTICATION PENDING (deliberate PoC exception).
+    This endpoint is intentionally left ANONYMOUS. It is called by the FROZEN
+    iOS Stage 4 field app, which has no credential contract: it sends no token
+    on any request. Gating it would brick the app in the field, so closing this
+    requires a deliberate field-app networking change (a per-device or
+    per-officer credential), which is tracked as the leading remaining
+    limitation rather than applied here.
+
+    The exposure is bounded: an anonymous submission can create a measurement,
+    but it cannot be priced (POST /api/assessments/ requires authentication),
+    read back (every sensitive GET requires authentication), or approved
+    (approve/override require SUPERVISOR).
     """
     parser_classes = (MultiPartParser, FormParser)
 
@@ -552,127 +702,197 @@ class BlockARMeasureAPIView(APIView):
       - volume_m3       : AR-calculated volume in m³
     Optional:
       - gps_latitude, gps_longitude, officer_id
+
+    SECURITY - FIELD-APP AUTHENTICATION PENDING (deliberate PoC exception).
+    This endpoint is intentionally left ANONYMOUS. It is called by the FROZEN
+    iOS Stage 4 field app, which has no credential contract: it sends no token
+    on any request. Gating it would brick the app in the field, so closing this
+    requires a deliberate field-app networking change (a per-device or
+    per-officer credential), which is tracked as the leading remaining
+    limitation rather than applied here.
+
+    The exposure is bounded: an anonymous submission can create a measurement,
+    but it cannot be priced (POST /api/assessments/ requires authentication),
+    read back (every sensitive GET requires authentication), or approved
+    (approve/override require SUPERVISOR).
     """
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
         import time
+        from django.conf import settings
+
+        from . import ar_ingest
+
         t_start = time.time()
         logger.info(f"[PERF] Server received request at {datetime.datetime.utcnow().isoformat()}")
 
-        block_id   = request.data.get('block_id', '').strip()
-        quarry_id  = request.data.get('quarry_id', '').strip()
-        officer_id = request.data.get('officer_id', '').strip()
-        uploaded_file = request.FILES.get('image')
-
-        # --- Validate required fields ---
-        if not block_id:
-            return Response({'error': 'block_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
+        # --- Validate everything BEFORE touching the database or the filesystem ---
         try:
-            length_m  = float(request.data.get('length_m', 0))
-            breadth_m = float(request.data.get('breadth_m', 0))
-            height_m  = float(request.data.get('height_m', 0))
-            volume_m3 = float(request.data.get('volume_m3', 0))
-        except (TypeError, ValueError):
-            return Response({'error': 'length_m, breadth_m, height_m, volume_m3 must be numbers.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if length_m <= 0 or breadth_m <= 0 or height_m <= 0:
-            return Response({'error': 'AR dimensions must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not uploaded_file:
-            return Response({'error': 'image file is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        t_val = time.time()
-        logger.info(f"[PERF] Validation completed: {int((t_val - t_start)*1000)} ms")
-
-        # --- Resolve or create block ---
-        block = Block.objects(block_id=block_id).first()
-        if block:
-            pass
-        else:
-            quarry_doc = None
-            if quarry_id:
-                quarry_doc = Quarry.objects(id=quarry_id).first()
-
-            block = Block(
-                block_id=block_id,
-                quarry=quarry_doc,
-                status='pending',
+            block_id = ar_ingest.clean_block_id(request.data.get('block_id'))
+            length_m = ar_ingest.clean_dimension(request.data.get('length_m'), 'length_m')
+            breadth_m = ar_ingest.clean_dimension(request.data.get('breadth_m'), 'breadth_m')
+            height_m = ar_ingest.clean_dimension(request.data.get('height_m'), 'height_m')
+            client_volume = ar_ingest.clean_optional_client_volume(request.data.get('volume_m3'))
+            latitude = ar_ingest.clean_coordinate(request.data.get('gps_latitude'), 'gps_latitude', 90)
+            longitude = ar_ingest.clean_coordinate(request.data.get('gps_longitude'), 'gps_longitude', 180)
+            uploaded_file = request.FILES.get('image')
+            image_format = ar_ingest.validate_image(uploaded_file)
+        except ar_ingest.ARIngestError as exc:
+            return Response(
+                {'error': exc.message, 'code': exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --- GPS ---
-        try:
-            lat = float(request.data.get('gps_latitude')) if request.data.get('gps_latitude') else None
-        except (TypeError, ValueError):
-            lat = None
-        try:
-            lon = float(request.data.get('gps_longitude')) if request.data.get('gps_longitude') else None
-        except (TypeError, ValueError):
-            lon = None
+        quarry_id = (request.data.get('quarry_id') or '').strip()
+        officer_id = (request.data.get('officer_id') or '').strip()
 
-        if lat:
-            block.gps_latitude = lat
-        if lon:
-            block.gps_longitude = lon
+        # Server-side volume is authoritative. The client's figure is compared
+        # and reported, never stored - it arrives from the phone and is what
+        # the seigniorage amount is ultimately derived from.
+        server_volume = length_m * breadth_m * height_m
+        volume_check = ar_ingest.compare_volume(server_volume, client_volume)
+
+        # --- Duplicate protection -------------------------------------------
+        # A block that already carries a measurement is never re-measured
+        # through this endpoint: that silently destroyed field data (and left
+        # approved_by/approved_at pointing at an approval of different numbers).
+        # A block registered but not yet measured is the legitimate
+        # register-then-measure flow and is allowed to proceed.
+        block = Block.objects(block_id=block_id).first()
+        if block is not None and block.measurement is not None:
+            return Response(
+                {
+                    'error': (
+                        f"Block '{block_id}' already has a measurement recorded "
+                        f"and was not modified. Use a different block_id, or have a "
+                        f"supervisor override the existing measurement."
+                    ),
+                    'code': 'block_already_measured',
+                    'block_id': block_id,
+                    'existing_measured_at': block.measurement.measured_at,
+                    'existing_status': block.status,
+                    'existing_approval_status': block.approval_status,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        is_new_block = block is None
+        if is_new_block:
+            block = Block(block_id=block_id, status='pending')
+
+        # --- Reference resolution -------------------------------------------
+        # An unresolved reference does not reject the submission: the measurement
+        # itself is real field data and must not be lost because master data has
+        # not been registered yet. The submitted identifier is preserved verbatim
+        # and flagged, so it can be reconciled later. Nothing is invented.
+        warnings = []
+        if quarry_id:
+            quarry_doc = Quarry.objects(id=quarry_id).first()
+            if quarry_doc is not None:
+                block.quarry = quarry_doc
+            else:
+                warnings.append('quarry_unresolved')
+            block.submitted_quarry_id = quarry_id
+        else:
+            warnings.append('quarry_missing')
+
         if officer_id:
             block.inspecting_officer_id = officer_id
+            if Officer.objects(officer_id=officer_id).first() is None:
+                warnings.append('officer_unresolved')
+        else:
+            warnings.append('officer_missing')
 
-        # --- Save raw image ---
-        from django.conf import settings
+        if not volume_check['agrees'] and volume_check['agrees'] is not None:
+            warnings.append('client_volume_mismatch')
+
+        block.reference_warnings = warnings
+
+        # --- GPS: 0.0 is a real coordinate, so test against None, not truthiness ---
+        if latitude is not None:
+            block.gps_latitude = latitude
+        if longitude is not None:
+            block.gps_longitude = longitude
+        if latitude is None or longitude is None:
+            warnings.append('gps_incomplete')
+            block.reference_warnings = warnings
+
+        # --- Save raw image ---------------------------------------------------
         raw_dir = os.path.join(settings.MEDIA_ROOT, 'raw')
         os.makedirs(raw_dir, exist_ok=True)
 
-        timestamp_str  = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        raw_filename   = f"{block_id}_{timestamp_str}_ar_raw.jpg"
-        raw_filepath   = os.path.join(raw_dir, raw_filename)
+        timestamp_str = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')
+        extension = 'png' if image_format == 'png' else 'jpg'
+        raw_filename = f"{block_id}_{timestamp_str}_ar_raw.{extension}"
+        raw_filepath = os.path.join(raw_dir, raw_filename)
+
+        # block_id passed clean_block_id, so it cannot contain a path separator;
+        # this assertion makes that guarantee explicit at the point it matters.
+        if os.path.dirname(os.path.relpath(raw_filepath, raw_dir)):
+            return Response(
+                {'error': 'Resolved image path escaped the media directory.', 'code': 'unsafe_path'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         with open(raw_filepath, 'wb+') as dst:
             for chunk in uploaded_file.chunks():
                 dst.write(chunk)
 
-        t_img = time.time()
-        logger.info(f"[PERF] Image saved to disk: {int((t_img - t_val)*1000)} ms")
-
         block.raw_image_path = os.path.relpath(raw_filepath, settings.MEDIA_ROOT).replace('\\', '/')
-        block.captured_at    = datetime.datetime.utcnow()
 
-        if block.raw_image_path not in (block.image_paths or []):
-            if not block.image_paths:
-                block.image_paths = []
+        # NOTE: the iOS client does not send a device capture timestamp, so this
+        # remains server receipt time. Documented rather than fabricated.
+        block.captured_at = datetime.datetime.utcnow()
+
+        if not block.image_paths:
+            block.image_paths = []
+        if block.raw_image_path not in block.image_paths:
             block.image_paths.append(block.raw_image_path)
 
-        # --- Save AR measurement ---
+        # --- Measurement ------------------------------------------------------
+        # confidence is left at the model default: the AR module reports no
+        # confidence value, and inventing one would be a fabricated AI metric.
         measurement_doc = Measurement(
             length_m=length_m,
             breadth_m=breadth_m,
             height_m=height_m,
-            volume_m3=volume_m3,
-            confidence=1.0,
+            volume_m3=server_volume,
             measurement_method='ar',
-            measured_at=datetime.datetime.utcnow()
+            measured_at=datetime.datetime.utcnow(),
         )
         block.measurement = measurement_doc
-        block.status      = 'measured'
-        block.cv_status   = 'success'
+        block.status = 'measured'
+        # No CV inference ran on this path. Claiming 'success' asserted a YOLO
+        # result that never happened; 'not_applicable' is the honest value and
+        # no backend logic branches on it (only display and an optional filter).
+        block.cv_status = 'not_applicable'
         block.save()
         _invalidate_cache()
 
-        t_db = time.time()
-        logger.info(f"[PERF] MongoDB write finished: {int((t_db - t_img)*1000)} ms")
-
-        # --- Audit log ---
-        audit = AuditLog(
+        # --- Audit ------------------------------------------------------------
+        # Written only after the block is persisted, so a failed validation can
+        # never leave an audit entry claiming a measurement was recorded.
+        audit_details = (
+            f"AR inspection: L={length_m}m, B={breadth_m}m, H={height_m}m, "
+            f"V(server)={server_volume:.6f}m3, V(client)={client_volume}, "
+            f"volume_agrees={volume_check['agrees']}, "
+            f"submitted_quarry_id={quarry_id or 'none'}, "
+            f"submitted_officer_id={officer_id or 'none'}, "
+            f"gps={'yes' if (latitude is not None and longitude is not None) else 'incomplete'}, "
+            f"reference_warnings={','.join(warnings) if warnings else 'none'}"
+        )
+        audit_entry = AuditLog(
             block=block,
+            block_id_snapshot=block.block_id,
             action='ar_measurement_submitted',
             actor=officer_id or 'FieldOfficer',
-            details=f'AR inspection: L={length_m}m, B={breadth_m}m, H={height_m}m, V={volume_m3}m³',
-            timestamp=datetime.datetime.utcnow()
+            details=audit_details,
+            timestamp=datetime.datetime.utcnow(),
         )
-        audit.save()
+        audit_entry.save()
 
-        t_done = time.time()
-        logger.info(f"[PERF] Response sent: Total server time {int((t_done - t_start)*1000)} ms")
+        logger.info(f"[PERF] Response sent: Total server time {int((time.time() - t_start)*1000)} ms")
 
         output = {
             'id': str(block.id),
@@ -699,9 +919,28 @@ class BlockARMeasureAPIView(APIView):
             'updated_at': block.updated_at,
         }
         serializer = BlockSerializer(output)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        # Existing contract first, then the PoC additions. Merging afterwards
+        # avoids BlockSerializer's read-only SkipField behaviour dropping them.
+        payload = dict(serializer.data)
+        payload.update({
+            'submitted_quarry_id': block.submitted_quarry_id,
+            'inspecting_officer_id': block.inspecting_officer_id,
+            'reference_warnings': list(block.reference_warnings or []),
+            'volume_check': volume_check,
+            'approval_status': block.approval_status,
+            'created_new_block': is_new_block,
+            # Real, persisted reference the officer can quote. This is the
+            # AuditLog document id - not a display-only random string - so it
+            # resolves to an actual governance record.
+            'receipt_id': str(audit_entry.id),
+            'audit_action': audit_entry.action,
+            'received_at': audit_entry.timestamp,
+        })
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 class BlockOverrideAPIView(APIView):
+    # Governance action: changes stored measurement data. Supervisor only.
+    permission_classes = [IsSupervisor]
     """
     POST: Supervise override for block measurements.
     """
@@ -717,7 +956,10 @@ class BlockOverrideAPIView(APIView):
         breadth_m = request.data.get('breadth_m')
         height_m = request.data.get('height_m')
         reason = request.data.get('reason', '')
-        actor = request.data.get('actor', 'Supervisor')
+        # Authenticated identity ONLY. A client-supplied 'actor' is ignored:
+        # previously any anonymous caller could override a measurement and sign
+        # it with any name, and the dashboard hardcoded 'Supervisor-1'.
+        actor = request.user.get_username()
         
         if length_m is None or breadth_m is None or height_m is None:
             return Response(
@@ -735,6 +977,13 @@ class BlockOverrideAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
             
+        # Prior dimensions, read before the measurement is replaced, so the
+        # audit entry can state what actually changed.
+        prior = block.measurement
+        prior_dims = (
+            f"{prior.length_m}/{prior.breadth_m}/{prior.height_m}" if prior else "none"
+        )
+
         # Snapshot the original measurement if not already saved
         if not block.original_measurement and block.measurement:
             block.original_measurement = block.measurement
@@ -757,9 +1006,15 @@ class BlockOverrideAPIView(APIView):
         _invalidate_cache()
         
         # Log to AuditLog
-        log_details = f"Manual override to L: {length_m}, B: {breadth_m}, H: {height_m}. Reason: {reason}"
+        log_details = (
+            f"Manual override: block_id={block.block_id}, "
+            f"old L/B/H={prior_dims}, "
+            f"new L/B/H={length_m}/{breadth_m}/{height_m}, "
+            f"actor={actor} (authenticated), reason={reason}"
+        )
         audit = AuditLog(
             block=block,
+            block_id_snapshot=block.block_id,
             action="manual_override",
             actor=actor,
             details=log_details,
@@ -813,6 +1068,8 @@ class BlockOverrideAPIView(APIView):
 
 
 class BlockApproveAPIView(APIView):
+    # Governance action: approves/rejects a block. Supervisor only.
+    permission_classes = [IsSupervisor]
     """
     POST: Approve or reject block inspection values.
     """
@@ -825,7 +1082,8 @@ class BlockApproveAPIView(APIView):
             )
             
         approval_status_val = request.data.get('approval_status')
-        actor = request.data.get('actor', 'Supervisor')
+        # Authenticated identity ONLY - see BlockOverrideAPIView.
+        actor = request.user.get_username()
         
         if approval_status_val not in ['approved', 'rejected']:
             return Response(
@@ -833,6 +1091,62 @@ class BlockApproveAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
             
+        previous_status = block.approval_status
+
+        # --- Idempotency (Phase 6G) -------------------------------------------
+        # Re-sending a decision the block already carries is a no-op, not a new
+        # governance event. block5 in the real database shows why: it was
+        # approved three times and the audit trail now claims three separate
+        # approval decisions for one act.
+        #
+        # Checked BEFORE the assessment prerequisite below, deliberately: a
+        # record approved under the older rules must not start returning an
+        # error when someone merely re-opens it.
+        if previous_status == approval_status_val:
+            return Response(
+                {
+                    "code": f"already_{approval_status_val}",
+                    "detail": (
+                        f"Block '{block.block_id}' is already {approval_status_val}. "
+                        f"No new decision was recorded."
+                    ),
+                    "block_id": block.block_id,
+                    "approval_status": block.approval_status,
+                    "approved_by": block.approved_by,
+                    "approved_at": block.approved_at,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # --- Assessment prerequisite (Phase 6G) --------------------------------
+        # A block may not become APPROVED until its seigniorage has been
+        # determined: approving first would endorse a record whose payable
+        # amount nobody has calculated. The correct order is
+        # measurement -> assessment -> supervisor review -> approval.
+        #
+        # REJECTION is deliberately NOT gated. Refusing a measurement you can
+        # see is wrong should not first require pricing it, and forcing an
+        # assessment before a rejection would create a financial record for a
+        # block that is being thrown out.
+        #
+        # Nothing is auto-created here: no assessment, no rate, no amount. The
+        # request is refused and the supervisor runs the assessment themselves.
+        if approval_status_val == 'approved':
+            from .models import Assessment as _Assessment
+            if _Assessment.objects(block=block).first() is None:
+                return Response(
+                    {
+                        "error": (
+                            f"Block '{block.block_id}' must have an assessment before it "
+                            f"can be approved. Create one via POST /api/assessments/ first."
+                        ),
+                        "code": "assessment_required_before_approval",
+                        "block_id": block.block_id,
+                        "approval_status": block.approval_status,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
         block.approval_status = approval_status_val
         block.approved_by = actor
         block.approved_at = datetime.datetime.utcnow()
@@ -842,9 +1156,16 @@ class BlockApproveAPIView(APIView):
         # Log to AuditLog
         audit = AuditLog(
             block=block,
+            block_id_snapshot=block.block_id,
             action=f"block_approval_{approval_status_val}",
             actor=actor,
-            details=f"Block inspection status updated to {approval_status_val}",
+            details=(
+                f"Approval decision: block_id={block.block_id}, "
+                f"action={approval_status_val}, "
+                f"old_status={previous_status}, new_status={approval_status_val}, "
+                f"actor={actor} (authenticated), "
+                f"reason={request.data.get('reason', 'none')}"
+            ),
             timestamp=datetime.datetime.utcnow()
         )
         audit.save()
@@ -895,6 +1216,10 @@ class BlockApproveAPIView(APIView):
 
 
 class BlockPDFAPIView(APIView):
+    # Phase 6B read-surface authentication. The report carries the complete assessment and audit record.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Retrieve and download PDF report.
     """
@@ -910,8 +1235,22 @@ class BlockPDFAPIView(APIView):
         from .models import Assessment
         assessment = Assessment.objects(block=block).first()
         
+        # POLICY CHANGE: every registered block is exportable.
+        #
+        # This used to return 409 assessment_required when the block had not been
+        # priced, so a measured-but-unassessed block could not be exported at
+        # all. The generator now produces a clearly-marked MEASUREMENT RECORD
+        # instead - every financial field reads "Not assessed", the title and
+        # disclaimer say so, and the report number is suffixed -M. Nothing is
+        # fabricated; the document simply reports what has and has not been
+        # determined.
         try:
             pdf_bytes = generate_block_pdf(block, assessment)
+        except ValueError as e:
+            return Response(
+                {"error": str(e), "code": "report_preconditions_unmet"},
+                status=status.HTTP_409_CONFLICT
+            )
         except Exception as e:
             return Response(
                 {"error": f"Failed to generate PDF: {e}"},
@@ -919,11 +1258,78 @@ class BlockPDFAPIView(APIView):
             )
             
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
-        response['Content-Disposition'] = f'inline; filename="inspection_report_{block_id}.pdf"'
+        # The filename says which document this is, so a folder of exports can be
+        # told apart at a glance: an unassessed block yields a measurement
+        # record, not an assessment report. Carries no session or secret data.
+        filename = (f"inspection_report_{block_id}.pdf" if assessment is not None
+                    else f"measurement_record_{block_id}.pdf")
+        response['Content-Disposition'] = f'inline; filename="{filename}"'
         return response
 
 
+class OMEPSExportAPIView(APIView):
+    # Phase 6B read-surface authentication. The export carries block, money, approval and audit in one document.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
+    """
+    GET /api/export/omeps/<block_id>/
+
+    OMEPS-ready export / integration contract - PENDING OFFICIAL OMEPS SCHEMA.
+
+    Packages the complete RTGS workflow for one block (block -> AR measurement ->
+    assessment -> approval -> audit) as a versioned JSON document an OMEPS
+    adapter can map onto the real specification once that specification exists.
+    This is an integration-readiness layer: it does not claim OMEPS integration,
+    does not define official OMEPS fields, and transmits nothing externally.
+
+    Read-only. No document is written, no audit entry is created, and the
+    response cache is not touched - repeated calls leave the database identical.
+
+    Contract details, source-of-truth rules and the adapter guidance live in
+    blocks/omeps_export.py and blocks/OMEPS_EXPORT_CONTRACT.md.
+    """
+
+    def get(self, request, block_id):
+        from . import omeps_export
+        from .models import Assessment
+
+        block = Block.objects(block_id=block_id).first()
+        if not block:
+            return Response(
+                {
+                    "error": f"Block with ID '{block_id}' not found.",
+                    "code": "block_not_found",
+                    "integration_status": omeps_export.INTEGRATION_STATUS,
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        assessment = Assessment.objects(block=block).first()
+
+        try:
+            document = omeps_export.build_export(block, assessment)
+        except omeps_export.ExportPreconditionError as e:
+            # A missing section is a clear integration error, never an export
+            # with fabricated or empty-but-present values.
+            return Response(
+                {
+                    "error": e.message,
+                    "code": e.code,
+                    "integration_status": omeps_export.INTEGRATION_STATUS,
+                    "export_schema_version": omeps_export.EXPORT_SCHEMA_VERSION,
+                },
+                status=e.status_code,
+            )
+
+        return Response(document, status=status.HTTP_200_OK)
+
+
 class BlockAuditLogsAPIView(APIView):
+    # Phase 6B read-surface authentication. The audit trail is governance data.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: List all audit logs for a block.
     """
@@ -951,6 +1357,10 @@ from .models import Officer, WeeklyOfficerSummary, Assessment, AuditLog
 from mongoengine.queryset.visitor import Q
 
 class OfficerAnalyticsAPIView(APIView):
+    # Phase 6B read-surface authentication. Officer performance is governance data.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Returns summaries for all officers.
     """
@@ -1006,6 +1416,10 @@ class OfficerAnalyticsAPIView(APIView):
 
 
 class OfficerWeeklyAnalyticsAPIView(APIView):
+    # Phase 6B read-surface authentication. Officer performance is governance data.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Returns 6 weeks historical summary trends for a specific officer.
     """
@@ -1044,6 +1458,10 @@ class OfficerWeeklyAnalyticsAPIView(APIView):
 
 
 class QuarryComparisonAPIView(APIView):
+    # Phase 6B read-surface authentication. Discloses per-quarry revenue.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Returns a summary for all quarries to compare performance metrics.
     """
@@ -1109,6 +1527,10 @@ class QuarryComparisonAPIView(APIView):
 
 
 class QuarryTrendAPIView(APIView):
+    # Phase 6B read-surface authentication. Discloses per-quarry revenue over time.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Returns a 6-week trend of block counts, volume, and revenue for a specific quarry.
     """
@@ -1162,6 +1584,10 @@ class QuarryTrendAPIView(APIView):
 
 
 class RevenueSummaryAPIView(APIView):
+    # Phase 6B read-surface authentication. Discloses aggregate revenue.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Returns total seigniorage, trends, and category summaries across the state.
     """
@@ -1180,8 +1606,18 @@ class RevenueSummaryAPIView(APIView):
         category_revenue = [{"category": k, "revenue": round(v, 2)} for k, v in categories.items()]
 
         # Gangsaw vs below-gangsaw revenue
-        gangsaw_revenue = sum(ass.indicative_seigniorage for ass in assessments if ass.gangsaw_classification == "Gangsaw Size")
-        below_gangsaw_revenue = sum(ass.indicative_seigniorage for ass in assessments if ass.gangsaw_classification != "Gangsaw Size")
+        # Official RTGS classification (blocks/seigniorage.py). The previous
+        # comparison matched the retired POC literal "Gangsaw Size", so every
+        # officially-assessed block fell into the below-gangsaw bucket.
+        from .seigniorage import ABOVE_GANGSAW, WITHIN_GANGSAW
+        gangsaw_revenue = sum(
+            ass.indicative_seigniorage for ass in assessments
+            if ass.gangsaw_classification == ABOVE_GANGSAW
+        )
+        below_gangsaw_revenue = sum(
+            ass.indicative_seigniorage for ass in assessments
+            if ass.gangsaw_classification == WITHIN_GANGSAW
+        )
 
         # 6-week weekly revenue trend
         weekly_revenue = []
@@ -1215,38 +1651,64 @@ class RevenueSummaryAPIView(APIView):
 
 
 class RevenueLeakageAPIView(APIView):
+    # Phase 6B read-surface authentication. Discloses revenue-variance findings.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Estimations for revenue leakage and recovery rates.
     """
     def get(self, request):
-        # Fetch all assessments ONCE and compute everything in-memory
-        all_assessments = _get_all_assessments()
-        
-        leakage_list = [a for a in all_assessments if a.variance_pct and a.variance_pct > 8.0]
-        total_count = len(all_assessments)
-        total_seigniorage = sum(a.indicative_seigniorage for a in all_assessments)
-        
-        # Calculate recovered value (the difference scaled by variance)
-        estimated_recovery = sum(
-            a.indicative_seigniorage * (a.variance_pct / 100.0)
-            for a in leakage_list
-        )
-        
-        variance_sum = sum(a.variance_pct for a in all_assessments if a.variance_pct)
-        avg_leakage = round(variance_sum / total_count, 2) if total_count > 0 else 0.0
+        """Leakage requires a real weighbridge figure to compare against.
 
+        Assessment.weighbridge_weight_mt is never written by any code path, and
+        variance_pct was only ever populated by random.uniform() in
+        generate_mock_data. This endpoint previously multiplied that random
+        number by the seigniorage amount and returned it as "revenue recovered"
+        - a fabricated money figure presented as a finding, with alert text
+        attributing it to "weighbridge returns" that do not exist.
+
+        It now reports honestly that the data is unavailable. It will produce
+        real numbers once weighbridge reconciliation is implemented.
+        """
+        all_assessments = _get_cached('all_assessments', lambda: list(Assessment.objects.all()))
+        with_weighbridge = [
+            a for a in all_assessments if a.weighbridge_weight_mt is not None
+        ]
+
+        if not with_weighbridge:
+            return Response({
+                "available": False,
+                "reason": "no_weighbridge_data",
+                "message": (
+                    "Not available - no weighbridge data. Leakage requires a recorded "
+                    "weighbridge weight to compare against the assessed tonnage."
+                ),
+                "assessments_total": len(all_assessments),
+                "assessments_with_weighbridge": 0,
+                "leakage_blocks_count": None,
+                "estimated_revenue_recovered": None,
+                "average_leakage_pct": None,
+            }, status=status.HTTP_200_OK)
+
+        leakage_list = [a for a in with_weighbridge if a.variance_pct and a.variance_pct > 8.0]
+        recovered = sum(a.indicative_seigniorage * (a.variance_pct / 100.0) for a in leakage_list)
+        variance_sum = sum(a.variance_pct for a in with_weighbridge if a.variance_pct)
         return Response({
+            "available": True,
+            "assessments_total": len(all_assessments),
+            "assessments_with_weighbridge": len(with_weighbridge),
             "leakage_blocks_count": len(leakage_list),
-            "total_blocks_count": total_count,
-            "estimated_revenue_recovered": round(estimated_recovery, 2),
-            "total_revenue": round(total_seigniorage, 2),
-            "average_leakage_pct": avg_leakage,
-            "label": "POC ESTIMATE - NOT ACTUAL GOVERNMENT REVENUE",
-            "disclaimer": "POC ONLY: Values generated from synthetic database fields."
+            "estimated_revenue_recovered": round(recovered, 2),
+            "average_leakage_pct": round(variance_sum / len(with_weighbridge), 2) if with_weighbridge else 0,
         }, status=status.HTTP_200_OK)
 
 
 class AuditReadinessAPIView(APIView):
+    # Phase 6B read-surface authentication. Compliance posture is governance data.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Compliance statistics grouping blocks into Green, Amber, Red completeness.
     """
@@ -1316,6 +1778,10 @@ class AuditReadinessAPIView(APIView):
 
 
 class AnalyticsAlertsAPIView(APIView):
+    # Phase 6B read-surface authentication. Alerts disclose governance exceptions.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Renders notification feeds for supervisor compliance.
     """
@@ -1325,20 +1791,42 @@ class AnalyticsAlertsAPIView(APIView):
         all_assessments = _get_all_assessments()
         alerts = []
         
-        # 1. High variance assessments
-        high_var = [a for a in all_assessments if a.variance_pct and a.variance_pct > 15.0][:5]
-        for ass in high_var:
-            block_id = ass.block.block_id if ass.block else 'UNKNOWN'
-            alerts.append({
-                "alert_id": f"ALT-VAR-{block_id}",
-                "severity": "CRITICAL",
-                "type": "HIGH_VARIANCE",
-                "title": f"High Dimensional Variance: {block_id}",
-                "description": f"Verified CV dimension differs from weighbridge returns by {ass.variance_pct}%.",
-                "related_entity": f"Block: {block_id}",
-                "timestamp": ass.created_at.strftime('%Y-%m-%d %H:%M:%S') if ass.created_at else ""
-            })
-            
+        # 1. Reference-integrity alerts, derived from real ingestion state.
+        #
+        # This replaces the former HIGH_VARIANCE rule, which was driven entirely
+        # by Assessment.variance_pct - a field no production path writes, only
+        # random.uniform() in generate_mock_data - and whose description told
+        # the supervisor the figure came from "weighbridge returns" when no
+        # weighbridge data exists anywhere in the system.
+        WARNING_TEXT = {
+            "quarry_unresolved": ("WARNING", "Unresolved quarry reference",
+                                  "The submitted quarry ID does not match any registered Quarry."),
+            "officer_unresolved": ("WARNING", "Unresolved officer reference",
+                                   "The submitted officer ID does not match any registered Officer."),
+            "quarry_missing": ("WARNING", "No quarry submitted",
+                               "The submission carried no quarry identifier."),
+            "officer_missing": ("WARNING", "No officer submitted",
+                                "The submission carried no officer identifier."),
+            "gps_incomplete": ("INFO", "GPS not captured",
+                               "The submission carried no usable GPS coordinates."),
+            "client_volume_mismatch": ("CRITICAL", "Client/server volume disagreement",
+                                       "The device-reported volume disagreed with L x B x H; the server value was stored."),
+        }
+        for b in all_blocks:
+            for warning in (b.reference_warnings or []):
+                severity, title, description = WARNING_TEXT.get(
+                    warning, ("INFO", warning, "See block record.")
+                )
+                alerts.append({
+                    "alert_id": f"ALT-{warning.upper()}-{b.block_id}",
+                    "severity": severity,
+                    "type": warning.upper(),
+                    "title": f"{title}: {b.block_id}",
+                    "description": description,
+                    "related_entity": f"Block: {b.block_id}",
+                    "timestamp": b.created_at.strftime('%Y-%m-%d %H:%M:%S') if b.created_at else ""
+                })
+
         # 2. Repeated capture attempts (> 2)
         for b in [b for b in all_blocks if b.capture_attempt_count and b.capture_attempt_count > 2][:5]:
             alerts.append({
@@ -1380,74 +1868,104 @@ class AnalyticsAlertsAPIView(APIView):
 
 
 class MapDataAPIView(APIView):
+    # Phase 6B read-surface authentication. Plots block locations against
+    # seigniorage values. IsAuthenticated, not IsSupervisor: any authenticated
+    # RTGS user may read; only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
-    GET: Returns coordinates for Quarries and inspection sites.
+    GET: Real captured coordinates only.
+
+    REWRITTEN (Phase 6E). The previous implementation iterated QUARRIES and,
+    when a quarry's free-text location failed to parse - which it always did -
+    synthesised a latitude and longitude from an MD5 hash of the quarry id. It
+    also defaulted the district to "Prakasam" and the lessee to "AP Granite Co."
+    for any quarry missing them, and labelled the whole payload
+    "DEMO / SYNTHETIC LOCATIONS".
+
+    Two consequences, both wrong once the field app started capturing GPS:
+      * blocks carrying a REAL fix were never plotted, because the endpoint only
+        knew about quarries, and there are no registered Quarry documents
+      * every coordinate it did return was invented
+
+    This version returns only coordinates that were actually recorded. A block
+    without a fix is COUNTED, never placed. Nothing is inferred or substituted.
     """
+
     def get(self, request):
-        quarries = _get_all_quarries()
         all_blocks = _get_all_blocks()
         all_assessments = _get_all_assessments()
-        
-        # Build block lookups
-        blocks_by_quarry = {}
-        for b in all_blocks:
-            if b.quarry:
-                blocks_by_quarry.setdefault(b.quarry.id, []).append(b)
-                
-        # Map block ID to assessment
+
         assessment_by_block_id = {}
         for ass in all_assessments:
             if ass.block:
                 assessment_by_block_id[ass.block.id] = ass
-                
-        map_points = []
-        for q in quarries:
-            blocks = blocks_by_quarry.get(q.id, [])
+
+        block_points = []
+        without_gps = 0
+        for b in all_blocks:
+            if b.gps_latitude is None or b.gps_longitude is None:
+                without_gps += 1
+                continue
+            ass = assessment_by_block_id.get(b.id)
+            block_points.append({
+                "block_id": b.block_id,
+                "latitude": b.gps_latitude,
+                "longitude": b.gps_longitude,
+                "submitted_quarry_id": b.submitted_quarry_id,
+                "officer_id": b.inspecting_officer_id,
+                "status": b.status,
+                "approval_status": b.approval_status,
+                "seigniorage": (round(ass.indicative_seigniorage, 2) if ass else None),
+                "captured_at": b.captured_at.isoformat() + "Z" if b.captured_at else None,
+            })
+
+        # Quarries appear ONLY when they carry a real, parseable coordinate pair.
+        # No hash fallback, and no invented district or lessee.
+        quarry_points = []
+        for q in _get_all_quarries():
+            if not q.location or "," not in q.location:
+                continue
+            parts = q.location.split(",")
+            try:
+                lat = float(parts[-2].strip())
+                lon = float(parts[-1].strip())
+            except (ValueError, IndexError):
+                continue
+            blocks = [b for b in all_blocks if b.quarry and b.quarry.id == q.id]
             revenue = sum(
                 assessment_by_block_id[b.id].indicative_seigniorage
-                for b in blocks
-                if b.id in assessment_by_block_id
+                for b in blocks if b.id in assessment_by_block_id
             )
-            
-            # Extract actual lat/lon or generate mock coordinates if missing
-            q_lat = None
-            q_lon = None
-            if q.location and "," in q.location:
-                parts = q.location.split(",")
-                try:
-                    q_lat = float(parts[-2].strip())
-                    q_lon = float(parts[-1].strip())
-                except ValueError:
-                    pass
-            
-            if q_lat is None:
-                # Deterministic coordinates based on quarry ID hash
-                h = int(hashlib.md5(str(q.id).encode()).hexdigest()[:8], 16)
-                q_lat = round(15.2 + (h % 9000) / 10000.0, 4)
-            if q_lon is None:
-                h2 = int(hashlib.md5((str(q.id) + 'lon').encode()).hexdigest()[:8], 16)
-                q_lon = round(79.2 + (h2 % 9000) / 10000.0, 4)
-                
-            map_points.append({
+            quarry_points.append({
                 "quarry_id": str(q.id),
                 "name": q.name,
-                "district": q.district or "Prakasam",
-                "lessee": q.lessee_name or "AP Granite Co.",
-                "latitude": q_lat,
-                "longitude": q_lon,
+                "district": q.district,          # null when not recorded
+                "lessee": q.lessee_name,         # null when not recorded
+                "latitude": lat,
+                "longitude": lon,
                 "block_count": len(blocks),
                 "revenue": round(revenue, 2),
-                "status": "active"
             })
-            
+
         return Response({
-            "quarries": map_points,
-            "label": "DEMO / SYNTHETIC LOCATIONS",
-            "disclaimer": "Synthetic coordinates inside Andhra Pradesh bounding boxes for POC visualization."
+            "blocks": block_points,
+            "quarries": quarry_points,
+            "blocks_plotted": len(block_points),
+            "blocks_without_gps": without_gps,
+            "label": "REAL CAPTURED COORDINATES",
+            "disclaimer": (
+                "Only coordinates actually recorded at capture are plotted. "
+                f"{without_gps} block(s) have no GPS fix and are counted here "
+                "rather than placed at an inferred location."
+            ),
         }, status=status.HTTP_200_OK)
 
 
 class ExecutiveOverviewAPIView(APIView):
+    # Phase 6B read-surface authentication. Discloses aggregate financial position.
+    # IsAuthenticated, not IsSupervisor: any authenticated RTGS user may
+    # read: only decisions are supervisor-gated.
+    permission_classes = [IsAuthenticated]
     """
     GET: Core numbers dashboard.
     """
@@ -1474,16 +1992,19 @@ class ExecutiveOverviewAPIView(APIView):
             conf_vals = [b.measurement.confidence for b in all_blocks if b.measurement]
             avg_confidence = (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0
 
-            # Estimated revenue recovery from high-variance assessments
-            estimated_recovery = sum(
-                ass.indicative_seigniorage * (ass.variance_pct / 100.0)
-                for ass in all_assessments
-                if ass.variance_pct and ass.variance_pct > 8.0
-            )
+            # Revenue recovery requires weighbridge reconciliation, which does
+            # not exist yet. Reported as None ("Not available") rather than
+            # derived from the random variance_pct that only generate_mock_data
+            # ever wrote. See RevenueLeakageAPIView for the full rationale.
+            estimated_recovery = None
 
-            # Critical Alerts count — inline computation (no sub-view call)
-            high_var_alerts = [a for a in all_assessments if a.variance_pct and a.variance_pct > 15.0]
-            critical_alerts_count = len(high_var_alerts[:5])
+            # Critical alerts now come from real ingestion warnings, not from a
+            # random variance figure. Counted uncapped - the old version was
+            # structurally capped at 5, so a genuine 40-alert situation reported 5.
+            critical_alerts_count = sum(
+                1 for b in all_blocks
+                if 'client_volume_mismatch' in (b.reference_warnings or [])
+            )
 
             # Compliance Readiness — inline computation (no sub-view call)
             assessments_by_block = {ass.block.id for ass in all_assessments if ass.block}
@@ -1551,7 +2072,7 @@ class ExecutiveOverviewAPIView(APIView):
                 "avg_confidence": round(avg_confidence, 2),
                 "override_rate": round(override_rate, 4),
                 "approval_rate": round(approval_rate, 4),
-                "estimated_revenue_recovered": round(estimated_recovery, 2),
+                "estimated_revenue_recovered": estimated_recovery,  # None until weighbridge reconciliation exists
                 "critical_alerts_count": critical_alerts_count,
                 "compliance_completeness_pct": round(completeness_pct, 1),
                 "completeness_percentage": round(completeness_pct, 1),
@@ -1567,3 +2088,138 @@ class ExecutiveOverviewAPIView(APIView):
 
 
 
+
+
+class AuthCsrfAPIView(APIView):
+    """GET /api/auth/csrf/ - hand the browser a CSRF cookie before logging in.
+
+    The dashboard authenticates with a Django SESSION, so every unsafe request
+    must carry a CSRF token. A browser that has never talked to this backend has
+    no csrftoken cookie yet, and the login POST is itself unsafe - so there has
+    to be one safe call that sets the cookie first. That is this endpoint.
+
+    @ensure_csrf_cookie sets the cookie on the response. The cookie is readable
+    by JavaScript by design (that is how the client echoes it back in the
+    X-CSRFToken header); the SESSION cookie is HttpOnly and never readable.
+
+    This is the documented Django flow, not a CSRF bypass: no endpoint is
+    exempted, and the login view below is explicitly csrf_protect'ed.
+    """
+
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def get(self, request):
+        return Response({"detail": "CSRF cookie set."}, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_protect, name="dispatch")
+class AuthLoginAPIView(APIView):
+    """POST /api/auth/login/ - username + password, Django session out.
+
+    Phase 6E. The dashboard previously asked the operator to paste an API token,
+    which meant a human handling a long-lived bearer credential by hand. This
+    authenticates against the SAME Django auth stack and the SAME User records -
+    no second backend, no parallel identity store - and returns a session.
+
+    NOTHING secret is returned: no token, no password, no hash. The session
+    lives in an HttpOnly cookie the browser manages, so the dashboard never
+    holds a credential it could leak.
+
+    csrf_protect is applied explicitly. DRF's SessionAuthentication only
+    enforces CSRF once a session user exists, so an anonymous login POST would
+    otherwise be unchecked - the decorator closes that gap rather than exempting
+    the endpoint.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []  # nothing to authenticate with yet
+
+    # One message for every failure mode. A different message for "no such user"
+    # versus "wrong password" would let an attacker enumerate valid usernames.
+    INVALID = "Invalid username or password."
+
+    def post(self, request):
+        username = (request.data.get("username") or "").strip()
+        password = request.data.get("password") or ""
+
+        if not username or not password:
+            return Response(
+                {"error": "Username and password are required.", "code": "missing_credentials"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # authenticate() returns None for a bad password, an unknown user AND an
+        # inactive account (ModelBackend.user_can_authenticate), so all three
+        # collapse into the same 401 with the same wording.
+        user = authenticate(request, username=username, password=password)
+        if user is None:
+            return Response(
+                {"error": self.INVALID, "code": "invalid_credentials"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        django_login(request, user)
+
+        from .permissions import OFFICER_GROUP, SUPERVISOR_GROUP, is_supervisor
+
+        groups = list(user.groups.values_list("name", flat=True))
+        if is_supervisor(user):
+            role = SUPERVISOR_GROUP
+        elif OFFICER_GROUP in groups:
+            role = OFFICER_GROUP
+        else:
+            role = None
+
+        # Identical shape to GET /api/auth/me/ so the dashboard has one contract.
+        return Response({
+            "username": user.get_username(),
+            "role": role,
+            "groups": groups,
+            "is_supervisor": is_supervisor(user),
+        }, status=status.HTTP_200_OK)
+
+
+class AuthLogoutAPIView(APIView):
+    """POST /api/auth/logout/ - end the Django session.
+
+    Requires an authenticated session, so DRF's SessionAuthentication enforces
+    CSRF on this POST automatically. Flushes the session server-side; the
+    browser's session cookie is cleared by django_logout.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        django_logout(request)
+        return Response({"detail": "Signed out."}, status=status.HTTP_200_OK)
+
+
+class AuthMeAPIView(APIView):
+    """GET /api/auth/me/ - who am I, according to the backend?
+
+    The dashboard calls this on load with a stored token so it can (a) confirm
+    the token is still valid and (b) learn the role, rather than trusting
+    anything it kept in localStorage. Read-only, and deliberately narrow: it
+    returns the username and role only - never the password hash, email, or any
+    other user field.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .permissions import OFFICER_GROUP, SUPERVISOR_GROUP, is_supervisor
+
+        groups = list(request.user.groups.values_list('name', flat=True))
+        if is_supervisor(request.user):
+            role = SUPERVISOR_GROUP
+        elif OFFICER_GROUP in groups:
+            role = OFFICER_GROUP
+        else:
+            role = None
+
+        return Response({
+            "username": request.user.get_username(),
+            "role": role,
+            "groups": groups,
+            "is_supervisor": is_supervisor(request.user),
+        }, status=status.HTTP_200_OK)

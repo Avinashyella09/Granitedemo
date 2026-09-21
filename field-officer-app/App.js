@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -9,7 +9,9 @@ import {
   Image,
   ActivityIndicator,
   Alert,
-  Dimensions
+  Dimensions,
+  Animated,
+  Easing
 } from 'react-native';
 
 import { StatusBar } from 'expo-status-bar';
@@ -22,6 +24,23 @@ import {
   setApiBaseUrl,
   getApiBaseUrl
 } from './src/services/api';
+
+// Multi-face measurement. Pure geometry + reconciliation, kept out of this file
+// so it can be unit tested on its own. It is a documented port of
+// backend/blocks/face_reconciliation.py, which remains the specification.
+import {
+  FACE_PLAN,
+  POINTS_PER_FACE,
+  RECONCILED,
+  INCOMPLETE,
+  CALIBRATION_PENDING,
+  DEFAULT_TOLERANCES,
+  evaluateFace,
+  reconcileFaces,
+  emptyFaces,
+  predictP4Refusal,
+  predictFaceClosureProblem,
+} from './src/multiFaceReconciliation';
 
 import GraniteARView from './modules/granite-ar/src/GraniteARView';
 
@@ -41,25 +60,69 @@ export default function App() {
   const [arStatus, setArStatus] =
     useState('Starting AR...');
 
-  const [arPoints, setArPoints] =
-    useState([]);
+  // Placed points are MIRRORED from the native layer, never accumulated here.
+  //
+  // Native owns the measurement: it decides what a tap places, it holds the ARKit anchors, and it
+  // reports the whole chain on every overlay update. JS used to keep its own parallel array and
+  // could refuse a point native had already accepted — after which the two counts were out of
+  // step for the rest of the session, so the UI asked for one point while native was waiting on
+  // another, or called the measurement complete a point early. One source of truth removes that
+  // entire class of bug.
+  const [arPoints, setArPoints] = useState([]);
 
-  const [arDistance, setArDistance] =
-    useState(null);
+  // Live edge lengths straight from native. Null until all four points exist.
+  const [arMeasurement, setArMeasurement] = useState(null);
 
-  // AR derived measurements (populated when P4 is tapped)
+  // The measurement the officer has ACCEPTED — snapshotted from arMeasurement so it cannot shift
+  // under them while they finish the rest of the form. This is what gets submitted.
   const [arLength, setArLength]   = useState(null);
   const [arBreadth, setArBreadth] = useState(null);
   const [arHeight, setArHeight]   = useState(null);
   const [arVolume, setArVolume]   = useState(null);
+  const [arAcceptedPoints, setArAcceptedPoints] = useState([]);
 
+  // --- Multi-face measurement state ------------------------------------------
+  // Four faces, four points each: 16 confirmed AR points in total.
+  //
+  // arPoints holds ONLY the face currently being captured. Confirmed faces live
+  // in `faces`, indexed by face index, so the app always knows which points
+  // belong to which face - the 16 points are never collapsed into one array.
+  const [faceIndex, setFaceIndex] = useState(0);
+  const [faces, setFaces] = useState(emptyFaces);
+  // The completed-but-not-yet-confirmed face, shown for review before advancing.
+  const [pendingFace, setPendingFace] = useState(null);
+  // Reconciliation is DERIVED from `faces`; it is never stored as truth.
+  const [reconciliation, setReconciliation] = useState(null);
+
+  // Action tokens. Native edge-triggers on a CHANGE of value and records the first value it is
+  // given without acting on it, so these only ever have to increase — see handleTapToken there.
   const [tapToken, setTapToken] = useState(0);
   const [resetToken, setResetToken] = useState(0);
+  const [undoToken, setUndoToken] = useState(0);
+
   const [arOverlayLabels, setArOverlayLabels] = useState([]);
+  // "A tap right now would be accepted."
   const [candidateValid, setCandidateValid] = useState(false);
-  const [trackingQuality, setTrackingQuality] = useState('GOOD');
+  const [trackingQuality, setTrackingQuality] = useState('INSUFFICIENT');
+  // Non-blocking observation from native about the chain placed so far.
+  const [arAdvisory, setArAdvisory] = useState('');
   const [arDiagnostics, setArDiagnostics] = useState(null);
   const [showDiag, setShowDiag] = useState(false);
+  // Mirrors showDiag so the 20 Hz overlay stream can skip the diagnostics setState entirely while
+  // the HUD is closed — diagnostics is the largest part of the payload and re-rendering for it
+  // every 50 ms is pure waste when nothing displays it.
+  const showDiagRef = useRef(false);
+
+  // Last actionable problem reported by native (why a tap was refused, etc.). Native explains
+  // exactly what is wrong; without this it never reached the screen, so a refused tap looked
+  // identical to the app doing nothing.
+  const [arProblem, setArProblem] = useState('');
+  const arProblemTimer = useRef(null);
+
+  // Measure-app-style reticle: spins slowly while searching for a stable surface,
+  // stops (and the ring snaps to full opacity) the instant a candidate is valid.
+  const reticleSpin = useRef(new Animated.Value(0)).current;
+  const reticleSpinAnim = useRef(null);
 
   // Whether we are submitting the final inspection
   const [submitting, setSubmitting] = useState(false);
@@ -811,101 +874,65 @@ export default function App() {
     );
 
   // =========================================================
-  // AR point selection
+  // AR events (native is the authority — see arPoints above)
   // =========================================================
 
-  const handleARPointSelected = (event) => {
-    const point = event.nativeEvent;
-    console.log('AR POINT:', point);
+  // By the time this fires the point already exists natively, with its own ARKit anchor.
+  //
+  // This handler accumulates the chain and derives the dimensions, because the frozen Stage 4
+  // native module does not send them: its onOverlayUpdate payload is exactly
+  // ["trackingQuality", "candidateValid", "labels", "diagnostics"] (+ candidateScreenX/Y) - see
+  // GraniteARView.swift emitOverlayUpdate. An earlier revision of this file expected native to
+  // supply `points` and `measurement`, so arPoints stayed empty, arMeasurement stayed null, the
+  // accept panel never rendered and ANALYZE BLOCK always aborted with "Complete the AR
+  // measurement first" - no submission could ever leave the phone.
+  //
+  // The geometry below is the implementation already proven on this device, not a second
+  // algorithm: native owns placement and anchoring, JS owns only the arithmetic over the four
+  // confirmed world points. Plausibility checks are deliberately NOT repeated here - canonical
+  // acceptARMeasurement already runs describeARProblems + describeARChainProblems.
+  const dist3d = (a, b) => Math.sqrt(
+    (b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2
+  );
 
-    setArPoints(previous => {
-      if (previous.length >= 4) {
+  const handleARPointSelected = (event) => {
+    const point = event.nativeEvent || {};
+    console.log(`[AR] point placed`, point.x, point.y, point.z, point.trackable);
+
+    const spec = FACE_PLAN[faceIndex];
+
+    setArPoints((previous) => {
+      // MULTI-FACE: four points completes ONE FACE, not the whole measurement.
+      // Native hard-locks at four (MeasurementState.isComplete) and refuses a
+      // fifth, so this bound mirrors native rather than adding a second rule.
+      if (previous.length >= POINTS_PER_FACE) {
         return previous;
       }
 
-      const dist3d = (a, b) => Math.sqrt(
-        (b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2
-      );
-
-      // Validate distance to previous point (must be >= 5cm)
-      if (previous.length > 0) {
-        const lastP = previous[previous.length - 1];
-        const stepDist = dist3d(lastP, point);
-        if (stepDist < 0.05) {
-          Alert.alert(
-            'Point Unstable / Too Close',
-            'Selected point is too close to the previous point (< 5 cm). Please select a distinct corner.'
-          );
-          return previous;
-        }
-      }
-
-      const newPoint = {
+      const nextPoints = [...previous, {
         x: point.x,
         y: point.y,
         z: point.z,
-        trackable: point.trackable || 'Plane'
-      };
+        trackable: point.trackable || 'Plane',
+      }];
 
-      const nextPoints = [...previous, newPoint];
+      const dimensionLabel = spec.dimensionType === 'length' ? 'LENGTH' : 'BREADTH';
 
       if (nextPoints.length === 1) {
-        setArDistance(null);
-        setArStatus('P1 set (Bottom-Front-Left) — aim at P2 (Bottom-Front-Right corner)');
-
+        setArStatus(`${spec.name} — P1 set. Now P2 along the ${dimensionLabel} edge (the LONG horizontal edge of this face).`);
       } else if (nextPoints.length === 2) {
-        const l = dist3d(nextPoints[0], nextPoints[1]);
-        setArDistance(l);
-        setArStatus(`Length: ${l.toFixed(2)} m — aim at P3 (Top-Front-Right corner for Height)`);
-
+        const d = dist3d(nextPoints[0], nextPoints[1]);
+        setArStatus(`${spec.name} — ${dimensionLabel} ${d.toFixed(2)} m. Now P3: directly BELOW P2 (BOTTOM-RIGHT).`);
       } else if (nextPoints.length === 3) {
         const h = dist3d(nextPoints[1], nextPoints[2]);
-        setArStatus(`Height: ${h.toFixed(2)} m — aim at P4 (Top-Back-Right corner for Depth/Breadth)`);
-
-      } else if (nextPoints.length === 4) {
-        // Canonical Definition:
-        // P1→P2 = Length (L)
-        // P2→P3 = Height (H)
-        // P3→P4 = Breadth/Depth (B)
-        const p1 = nextPoints[0], p2 = nextPoints[1], p3 = nextPoints[2], p4 = nextPoints[3];
-        
-        const l = dist3d(p1, p2);
-        const h = dist3d(p2, p3);
-        const b = dist3d(p3, p4);
-
-        // Vector direction analysis
-        const v1 = { x: p2.x - p1.x, y: p2.y - p1.y, z: p2.z - p1.z };
-        const v2 = { x: p3.x - p2.x, y: p3.y - p2.y, z: p3.z - p2.z };
-        const v3 = { x: p4.x - p3.x, y: p4.y - p3.y, z: p4.z - p3.z };
-
-        // Dot products for orthogonality
-        const dot12 = (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z) / (l * h);
-        const dot23 = (v2.x * v3.x + v2.y * v3.y + v2.z * v3.z) / (h * b);
-
-        const v = parseFloat((l * b * h).toFixed(4));
-        const maxFrontDim = Math.max(l, h);
-
-        // Geometry & volume sanity checks
-        const isSanelyBounded = (l >= 0.1 && l <= 10.0) && (h >= 0.1 && h <= 5.0) && (b >= 0.1 && b <= 5.0);
-        const isDepthPlausible = b <= 2.5 * maxFrontDim && v <= 25.0;
-        const isOrthogonalEnough = Math.abs(dot12) < 0.75 && Math.abs(dot23) < 0.75;
-
-        if (!isSanelyBounded || !isDepthPlausible || !isOrthogonalEnough) {
-          Alert.alert(
-            'Validation Failed',
-            'Measurement could not be validated. Geometrical vectors are inconsistent or P4 is outside expected block bounds. Please rescan the block.'
-          );
-          setArStatus('❌ Measurement could not be validated. Please rescan the block.');
-          return previous;
-        }
-
-        setArLength(parseFloat(l.toFixed(4)));
-        setArBreadth(parseFloat(b.toFixed(4)));
-        setArHeight(parseFloat(h.toFixed(4)));
-        setArVolume(v);
-
+        setArStatus(`${spec.name} — HEIGHT ${h.toFixed(2)} m. Now P4: BOTTOM-LEFT, across from P3 and below P1.`);
+      } else if (nextPoints.length === POINTS_PER_FACE) {
+        // Face complete. Evaluate it, but do NOT advance - the officer confirms.
+        const evaluated = evaluateFace(spec, nextPoints, DEFAULT_TOLERANCES);
+        setPendingFace(evaluated);
         setArStatus(
-          `✅ Validated: L=${l.toFixed(2)}m  B=${b.toFixed(2)}m  H=${h.toFixed(2)}m  V=${v}m³`
+          `${spec.name} complete — ${dimensionLabel} ${evaluated.dimension.toFixed(2)} m, ` +
+          `HEIGHT ${evaluated.height.toFixed(2)} m. Review and confirm.`
         );
       }
 
@@ -913,29 +940,48 @@ export default function App() {
     });
   };
 
-  // =========================================================
-  // Reset AR
-  // =========================================================
+  // Diagnostic trace of the session. Printed only when a value actually CHANGES, so the 20 Hz
+  // overlay stream cannot flood the log. This is what makes a placement reviewable afterwards —
+  // raycast source, tracking state, advisories and anchor refinement — without opening the HUD.
+  const arTraceRef = useRef({ tracking: '', source: '', advisory: '', refinementMm: 0, armed: true });
 
-  const resetAR = () => {
-    setArPoints([]);
-    setArDistance(null);
-    setArStatus('Starting AR...');
-    setArLength(null);
-    setArBreadth(null);
-    setArHeight(null);
-    setArVolume(null);
-    setArOverlayLabels([]);
-    setCandidateValid(false);
-    setTrackingQuality('GOOD');
-    setTapToken(0);
-    setResetToken((t) => t + 1);
+  const traceAROverlay = (data) => {
+    const trace = arTraceRef.current;
+    const diagnostics = data.diagnostics || {};
+
+    if (data.trackingQuality && data.trackingQuality !== trace.tracking) {
+      trace.tracking = data.trackingQuality;
+      console.log('[AR-TRACK]', data.trackingQuality, diagnostics.trackingState || '');
+    }
+    // Deliberately NOT logged per change: the raycast source legitimately flips many times a
+    // second as the reticle crosses between reconstructed mesh, a detected plane and empty space,
+    // which floods the log. The source that matters is the one recorded on the placement line.
+    const advisory = data.advisory || '';
+    if (advisory !== trace.advisory) {
+      trace.advisory = advisory;
+      if (advisory) console.log('[AR-ADVISORY]', advisory);
+    }
+    // High-water mark only, and only once it moves a visible amount, so routine sub-millimetre
+    // polish stays quiet while a real relocalisation jump is impossible to miss.
+    const refinementMm = diagnostics.anchorRefinementMm || 0;
+    if (refinementMm > trace.refinementMm + 5) {
+      trace.refinementMm = refinementMm;
+      console.log('[AR-DRIFT] placed points refined by', refinementMm.toFixed(1), 'mm since placement');
+    }
   };
 
   const handleAROverlayUpdate = (event) => {
     const data = event.nativeEvent;
     if (!data) return;
 
+    traceAROverlay(data);
+
+    if (Array.isArray(data.points)) {
+      setArPoints(data.points.map(([x, y, z]) => ({ x, y, z })));
+    }
+    if (data.measurement !== undefined) {
+      setArMeasurement(data.measurement || null);
+    }
     if (data.labels) {
       setArOverlayLabels(data.labels);
     }
@@ -945,30 +991,304 @@ export default function App() {
     if (data.trackingQuality) {
       setTrackingQuality(data.trackingQuality);
     }
-    if (data.diagnostics) {
+    if (data.advisory !== undefined) {
+      setArAdvisory(data.advisory || '');
+    }
+    // Only while the HUD is actually open — see showDiagRef.
+    if (showDiagRef.current && data.diagnostics) {
       setArDiagnostics(data.diagnostics);
     }
   };
 
-  const getARInstruction = () => {
-    if (trackingQuality === 'INSUFFICIENT') {
-      return 'Move phone slowly to scan the block';
+  useEffect(() => {
+    showDiagRef.current = showDiag;
+  }, [showDiag]);
+
+  // A pending "why that tap was refused" timer must not outlive the screen.
+  useEffect(() => () => {
+    if (arProblemTimer.current) {
+      clearTimeout(arProblemTimer.current);
+      arProblemTimer.current = null;
     }
-    switch (arPoints.length) {
-      case 0:
-        return 'Select P1 (Bottom-Front-Left corner)';
-      case 1:
-        return 'Select P2 (Bottom-Front-Right corner)';
-      case 2:
-        return 'Select P3 (Top-Front-Right corner for Height)';
-      case 3:
-        return 'Select P4 (Top-Back-Right corner for Depth)';
-      case 4:
-        return 'Measurement Validated';
-      default:
-        return 'Move phone slowly to scan the block';
+  }, []);
+
+  // =========================================================
+  // AR actions
+  // =========================================================
+
+  const placeARPoint = () => {
+    setTapToken((t) => t + 1);
+  };
+
+  // Removes only the most recent point. Before this existed, one misplaced corner cost the whole
+  // measurement, because a full reset was the only way out of it.
+  const undoLastARPoint = () => {
+    setUndoToken((t) => t + 1);
+  };
+
+  // Clears the CURRENT face only. Confirmed faces survive, and the native
+  // reset clears measurement state without restarting the ARSession - world
+  // tracking, planes and the scene mesh stay warm while the officer walks to
+  // the next face (verified: GraniteARView.performReset has no session.run).
+  const resetCurrentFace = () => {
+    setArPoints([]);
+    setPendingFace(null);
+    setArOverlayLabels([]);
+    setCandidateValid(false);
+    setArAdvisory('');
+    setArProblem('');
+    const spec = FACE_PLAN[faceIndex];
+    setArStatus(`${spec.name} — place P1 of 4.`);
+    // tapToken is deliberately NOT zeroed. Native edge-triggers on a change of
+    // value, so a token that only ever increases can never replay an old action.
+    setResetToken((t) => t + 1);
+  };
+
+  // Clears the ENTIRE multi-face measurement: all four faces and the accepted
+  // values. Used when starting a new measurement, not between faces.
+  const resetAR = () => {
+    setArPoints([]);
+    setPendingFace(null);
+    setFaces(emptyFaces());
+    setFaceIndex(0);
+    setReconciliation(null);
+    setArOverlayLabels([]);
+    setCandidateValid(false);
+    setArAdvisory('');
+    setArProblem('');
+    setArStatus('Starting AR...');
+    setArLength(null);
+    setArBreadth(null);
+    setArHeight(null);
+    setArVolume(null);
+    setArAcceptedPoints([]);
+    setResetToken((t) => t + 1);
+  };
+
+  // Commits the reviewed face and advances. Reconciliation is recomputed from
+  // the full face set every time, so it can never lag behind the faces.
+  const confirmCurrentFace = () => {
+    if (!pendingFace || pendingFace.points.length !== POINTS_PER_FACE) return;
+
+    const nextFaces = [...faces];
+    nextFaces[faceIndex] = pendingFace;
+    setFaces(nextFaces);
+    setReconciliation(reconcileFaces(nextFaces, DEFAULT_TOLERANCES));
+
+    setArPoints([]);
+    setPendingFace(null);
+    setArOverlayLabels([]);
+    setCandidateValid(false);
+    setResetToken((t) => t + 1);
+
+    const nextIndex = faceIndex + 1;
+    if (nextIndex < FACE_PLAN.length) {
+      setFaceIndex(nextIndex);
+      setArStatus(`${FACE_PLAN[nextIndex].name} — walk to that face and place P1 of 4.`);
+    } else {
+      setArStatus('All four faces captured — review the reconciled measurement.');
     }
   };
+
+  // Re-measure a face already confirmed. Only the chosen face is cleared.
+  const remeasureFace = (index) => {
+    const nextFaces = [...faces];
+    nextFaces[index] = null;
+    setFaces(nextFaces);
+    setReconciliation(reconcileFaces(nextFaces, DEFAULT_TOLERANCES));
+    setFaceIndex(index);
+    setArPoints([]);
+    setPendingFace(null);
+    setResetToken((t) => t + 1);
+    setArStatus(`${FACE_PLAN[index].name} — place P1 of 4.`);
+  };
+
+  // Plausibility bounds for a quarry block. These WARN — they never discard points. The previous
+  // build cleared all four the instant the fourth failed a check, so one bad reading cost the
+  // entire measurement and left the officer nothing to correct.
+  const AR_PLAUSIBILITY = {
+    length:  { min: 0.1, max: 10.0, label: 'Length' },
+    height:  { min: 0.1, max: 5.0,  label: 'Height' },
+    breadth: { min: 0.1, max: 5.0,  label: 'Breadth' },
+  };
+
+  const describeARProblems = (measurement) => {
+    const cm = (metres) => `${(metres * 100).toFixed(0)} cm`;
+    const problems = [];
+    Object.keys(AR_PLAUSIBILITY).forEach((key) => {
+      const { min, max, label } = AR_PLAUSIBILITY[key];
+      const value = measurement[key];
+      if (value < min || value > max) {
+        problems.push(`${label} is ${cm(value)} (expected ${cm(min)} to ${max} m)`);
+      }
+    });
+    if (measurement.volume > 25) {
+      problems.push(`Volume is ${measurement.volume.toFixed(2)} m³ (above the 25 m³ limit)`);
+    }
+    return problems;
+  };
+
+  // Length/Height/Breadth are only three independent dimensions if the three chained edges point
+  // in genuinely different directions. Native checks CONSECUTIVE pairs for the on-screen hint, but
+  // the pair that actually goes wrong in the field is edge 1 vs edge 3: tracing a face — along,
+  // up, back along — leaves them anti-parallel, every consecutive angle still reads ~90 degrees,
+  // and L x H x B silently multiplies the same dimension twice. Measured on-device at 0.995-0.99999
+  // for a face trace and near 0 for a real block chain, so 0.85 separates them with wide margin.
+  const AR_MAX_EDGE_ALIGNMENT = 0.85;
+
+  const describeARChainProblems = (points) => {
+    if (!points || points.length !== 4) return [];
+    const subtract = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
+    const magnitude = (v) => Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+
+    const edge1 = subtract(points[1], points[0]);
+    const edge3 = subtract(points[3], points[2]);
+    const length1 = magnitude(edge1);
+    const length3 = magnitude(edge3);
+    if (length1 < 0.001 || length3 < 0.001) return [];
+
+    const alignment = Math.abs(
+      (edge1.x * edge3.x + edge1.y * edge3.y + edge1.z * edge3.z) / (length1 * length3)
+    );
+    if (alignment <= AR_MAX_EDGE_ALIGNMENT) return [];
+
+    const degrees = (Math.acos(Math.min(alignment, 1)) * 180) / Math.PI;
+    return [
+      `The Breadth edge runs back along the Length edge (only ${degrees.toFixed(0)}° apart), so these are not three independent dimensions — this looks like one flat face, and the volume would multiply Length twice`,
+    ];
+  };
+
+  // Freezes the RECONCILED measurement into the values that get submitted.
+  //
+  // These come from reconcileFaces() across all four faces - never from one
+  // face's raw readings. If reconciliation did not succeed there is nothing to
+  // commit, and the caller is gated so it cannot be reached.
+  const commitReconciledMeasurement = (result) => {
+    const round = (value) => parseFloat(Number(value).toFixed(4));
+    setArLength(round(result.finalLengthM));
+    setArBreadth(round(result.finalBreadthM));
+    setArHeight(round(result.finalHeightM));
+    setArVolume(round(result.volumeM3));
+    // Every confirmed point from all four faces, tagged with its face, so the
+    // evidence behind the reconciled figure travels with it.
+    setArAcceptedPoints(
+      faces.flatMap((face) => (face ? face.points.map((pt, i) => ({
+        ...pt, face_index: face.index, face_name: face.name, point_index: i + 1,
+      })) : []))
+    );
+    setScreen('new-inspection');
+  };
+
+  const acceptARMeasurement = () => {
+    const result = reconciliation;
+
+    // Hard gate. A volume that does not exist cannot be submitted.
+    if (!result || result.status !== RECONCILED || result.volumeM3 == null) {
+      const reasons = (result && result.blockingReasons && result.blockingReasons.length)
+        ? result.blockingReasons.join('\n\n')
+        : 'All four faces must be captured and confirmed first.';
+      Alert.alert('Measurement not usable yet', reasons);
+      return;
+    }
+
+    if (result.warnings && result.warnings.length > 0) {
+      console.warn('[AR] reconciled with face warnings:', result.warnings.join(' | '));
+    }
+
+    commitReconciledMeasurement(result);
+  };
+
+  // Measure-app-style reticle animation: spin continuously while searching, stop cleanly (ring
+  // holds still, fully opaque) the moment a candidate locks in.
+  useEffect(() => {
+    if (candidateValid) {
+      if (reticleSpinAnim.current) {
+        reticleSpinAnim.current.stop();
+        reticleSpinAnim.current = null;
+      }
+      reticleSpin.setValue(0);
+      return;
+    }
+
+    reticleSpinAnim.current = Animated.loop(
+      Animated.timing(reticleSpin, {
+        toValue: 1,
+        duration: 1400,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    );
+    reticleSpinAnim.current.start();
+
+    return () => {
+      if (reticleSpinAnim.current) {
+        reticleSpinAnim.current.stop();
+        reticleSpinAnim.current = null;
+      }
+    };
+  }, [candidateValid]);
+
+  // Guidance names the DIMENSION each edge feeds, never which physical corner to aim at. Which
+  // corners a given block needs is the officer's call — the app only needs to know which edge is
+  // the length, which is the height and which is the breadth, and placement order fixes that.
+  // Per-face edge names. P1->P2 is the face's own horizontal dimension, P2->P3
+  // is height, P3->P4 and P4->P1 close the quadrilateral.
+  const faceEdgeNames = (spec) => [
+    spec.dimensionType === 'length' ? 'LENGTH' : 'BREADTH',
+    'HEIGHT',
+    'CLOSING EDGE',
+  ];
+
+  const getARInstruction = () => {
+    if (trackingQuality === 'INSUFFICIENT') {
+      return 'Move the phone slowly across the block to start tracking';
+    }
+    if (allFacesCaptured && !pendingFace) {
+      return 'All four faces captured — review the reconciled measurement below';
+    }
+    const spec = FACE_PLAN[faceIndex];
+    if (pendingFace) {
+      return `${spec.name} complete — confirm it to continue`;
+    }
+    if (arPoints.length >= POINTS_PER_FACE) {
+      return `${spec.name}: four corners placed — check the face below`;
+    }
+    if (arPoints.length === 0) {
+      return candidateValid
+        ? `${spec.name}: tap + to place corner 1 of 4`
+        : 'Hold the reticle on the block until the ring turns solid';
+    }
+    const edge = faceEdgeNames(spec)[arPoints.length - 1];
+    return candidateValid
+      ? `${spec.name}: tap + to place corner ${arPoints.length + 1} and close the ${edge} edge`
+      : `${spec.name}: aim at the next corner and hold steady`;
+  };
+
+  // Native silently refuses a 4th point that fails validateP4 and reports only
+  // a generic "not a plausible block corner", which on a face the officer
+  // believes is correct reads as the app being broken. Recompute the same rules
+  // against the LIVE candidate so the specific problem can be named before the
+  // tap. Read-only: it never places or blocks a point itself.
+  const p4Warning = (arPoints.length === 3 && arDiagnostics
+    && Number.isFinite(arDiagnostics.candidateX))
+    ? predictP4Refusal(arPoints, {
+        x: arDiagnostics.candidateX,
+        y: arDiagnostics.candidateY,
+        z: arDiagnostics.candidateZ,
+      })
+    : null;
+
+  // A face whose opening edge is under native's 5 cm closing-edge floor can
+  // never be completed. Caught at P2 rather than letting the officer place P3
+  // and then discover P4 will not go down.
+  const closureWarning = predictFaceClosureProblem(arPoints);
+
+  // Derived, never stored as truth.
+  const capturedFaceCount = faces.filter(Boolean).length;
+  const allFacesCaptured = capturedFaceCount === FACE_PLAN.length;
+  const canUseMeasurement = Boolean(
+    reconciliation && reconciliation.status === RECONCILED && reconciliation.volumeM3 != null
+  );
 
   // =========================================================
   // Submit AR Inspection (Analyze Block)
@@ -988,7 +1308,11 @@ export default function App() {
     }
 
     if (arLength == null || arBreadth == null || arHeight == null) {
-      Alert.alert('Error', 'Complete the AR measurement (select all 4 points) first.');
+      Alert.alert(
+        'Error',
+        'Complete the multi-face AR measurement first: all four faces (Front, Right Side, '
+        + 'Back, Left Side) must be captured and reconciled.'
+      );
       return;
     }
 
@@ -1011,7 +1335,7 @@ export default function App() {
         height_m:      arHeight,
         volume_m3:     arVolume,
         imageUri:      imageUri,
-        ar_points:     arPoints,
+        ar_points:     arAcceptedPoints,
         _tStart:       tStart,
       });
 
@@ -1516,30 +1840,82 @@ export default function App() {
 
       {screen === 'ar-measure' && (
         <View style={styles.arContainer}>
-          {/* Native ARCore view */}
+          {/* Native ARKit (iOS, LiDAR-aware) / ARCore (Android) view */}
           <GraniteARView
             style={styles.arView}
             tapToken={tapToken}
             resetToken={resetToken}
+            undoToken={undoToken}
             onStatus={(event) => {
               const status = event.nativeEvent?.status || 'UNKNOWN';
-              const message = event.nativeEvent?.message;
-              setArStatus(message ? `${status}: ${message}` : status);
+              const message = event.nativeEvent?.message || '';
+              console.log('[AR-STATUS]', status, message);
+              setArStatus(message || status);
+
+              // Statuses that mean "your tap did not do what you wanted". These are surfaced in
+              // their own pill so a refusal is never silent.
+              const BLOCKING = [
+                'NO_HIT',
+                'POINT_REJECTED',
+                'DEVICE_UNSTABLE',
+                'TRACKING_LIMITED',
+                'CAMERA_DENIED',
+                'AR_NOT_SUPPORTED',
+                'AR_ERROR',
+                'COMPLETE',
+              ];
+              if (arProblemTimer.current) {
+                clearTimeout(arProblemTimer.current);
+                arProblemTimer.current = null;
+              }
+              if (BLOCKING.includes(status)) {
+                setArProblem(message || status);
+                // Clears itself so a stale complaint does not sit on screen once resolved.
+                arProblemTimer.current = setTimeout(() => setArProblem(''), 4000);
+              } else {
+                setArProblem('');
+              }
             }}
             onPointSelected={handleARPointSelected}
             onOverlayUpdate={handleAROverlayUpdate}
           />
 
-          {/* Center Target Reticle (when points < 4) */}
+          {/* Centre reticle. Two honest states: a spinning arc while no surface is locked, and a
+              solid ring the moment a tap would be accepted. Deliberately not green — a green ring
+              reads as a placed point, and this is an aiming guide, not a point. */}
           {arPoints.length < 4 && (
             <View style={styles.reticleContainer} pointerEvents="none">
-              <View style={[styles.reticleRing, { borderColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]}>
-                <View style={[styles.reticleDot, { backgroundColor: candidateValid ? '#FFFFFF' : 'rgba(255,255,255,0.4)' }]} />
-              </View>
+              {candidateValid ? (
+                <View style={[styles.reticleRing, { borderColor: '#FFFFFF' }]}>
+                  <View style={[styles.reticleDot, { backgroundColor: '#FFFFFF' }]} />
+                </View>
+              ) : (
+                <Animated.View
+                  style={[
+                    styles.reticleRing,
+                    {
+                      borderTopColor: '#FFFFFF',
+                      borderRightColor: 'rgba(255,255,255,0.22)',
+                      borderBottomColor: 'rgba(255,255,255,0.22)',
+                      borderLeftColor: 'rgba(255,255,255,0.22)',
+                      transform: [{
+                        rotate: reticleSpin.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: ['0deg', '360deg'],
+                        }),
+                      }],
+                    },
+                  ]}
+                >
+                  {/* The dot sits at the ring's centre, so the parent's rotation
+                      while searching is not visible on it. */}
+                  <View style={[styles.reticleDot, { backgroundColor: 'rgba(255,255,255,0.4)' }]} />
+                </Animated.View>
+              )}
             </View>
           )}
 
-          {/* Floating Edge Distance Badges (iPhone Measure style) */}
+          {/* Floating edge distance badges (iPhone Measure style) */}
           {arOverlayLabels.map((lbl) => (
             <View
               key={lbl.id}
@@ -1557,100 +1933,311 @@ export default function App() {
             </View>
           ))}
 
-          {/* Top Status Pill Overlay + Diagnostic Toggle */}
+          {/* Top overlay: instruction, progress, advisories, diagnostics toggle */}
           <View style={styles.arTopOverlay} pointerEvents="box-none">
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
               <View style={styles.topStatusPill}>
                 <Text style={styles.topStatusText}>{getARInstruction()}</Text>
               </View>
               <TouchableOpacity
-                style={{ backgroundColor: showDiag ? '#10b981' : 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 16, borderHeight: 1, borderColor: '#334155' }}
-                onPress={() => setShowDiag(prev => !prev)}
+                style={[styles.diagToggleBtn, showDiag && styles.diagToggleBtnOn]}
+                onPress={() => setShowDiag((previous) => !previous)}
               >
-                <Text style={{ color: '#FFFFFF', fontSize: 11, fontWeight: '700' }}>DIAG</Text>
+                <Text style={styles.diagToggleText}>DIAG</Text>
               </TouchableOpacity>
             </View>
+
+            {/* FACE banner: which of the four faces is being measured. */}
+            <View style={styles.arProgressRow} pointerEvents="none">
+              <Text style={styles.arInstructionText}>
+                {allFacesCaptured && !pendingFace
+                  ? `ALL 4 FACES CAPTURED — ${capturedFaceCount * POINTS_PER_FACE} points`
+                  : `${FACE_PLAN[faceIndex].name.toUpperCase()} FACE — ${faceIndex + 1}/${FACE_PLAN.length}` +
+                    `   ·   corner ${Math.min(arPoints.length + (pendingFace ? 0 : 1), POINTS_PER_FACE)}/${POINTS_PER_FACE}`}
+              </Text>
+            </View>
+
+            {/* Face pips: one per face, filled once that face is confirmed. */}
+            <View style={styles.arProgressRow} pointerEvents="none">
+              {FACE_PLAN.map((spec) => (
+                <View
+                  key={`face-${spec.index}`}
+                  style={[
+                    styles.arProgressPip,
+                    { width: 22, borderRadius: 3 },
+                    faces[spec.index] && styles.arProgressPipFilled,
+                    spec.index === faceIndex && !faces[spec.index] && { borderColor: '#FFFFFF', borderWidth: 1.5 },
+                  ]}
+                />
+              ))}
+            </View>
+
+            {/* Point pips: the four corners of the CURRENT face. */}
+            <View style={styles.arProgressRow} pointerEvents="none">
+              {[0, 1, 2, 3].map((index) => (
+                <View
+                  key={index}
+                  style={[
+                    styles.arProgressPip,
+                    index < arPoints.length && styles.arProgressPipFilled,
+                  ]}
+                />
+              ))}
+            </View>
+
+            {/* A face that can never be closed, caught at P2. */}
+            {closureWarning ? (
+              <View style={styles.arProblemPill} pointerEvents="none">
+                <Text style={styles.arProblemText}>⚠ {closureWarning.message}</Text>
+              </View>
+            ) : null}
+
+            {/* A 4th point that native WILL refuse, named before the tap. */}
+            {p4Warning ? (
+              <View style={styles.arProblemPill} pointerEvents="none">
+                <Text style={styles.arProblemText}>⚠ {p4Warning.message}</Text>
+              </View>
+            ) : null}
+
+            {/* Why a tap was refused. */}
+            {arProblem ? (
+              <View style={styles.arProblemPill} pointerEvents="none">
+                <Text style={styles.arProblemText}>{arProblem}</Text>
+              </View>
+            ) : null}
+
+            {/* Advisory — an observation about the placed chain, never a refusal. The points stay
+                exactly where they were put; this only tells the officer what it looks like. */}
+            {arAdvisory ? (
+              <View style={styles.arAdvisoryPill} pointerEvents="none">
+                <Text style={styles.arAdvisoryText}>{arAdvisory}</Text>
+              </View>
+            ) : null}
           </View>
 
-          {/* Development Diagnostic Overlay HUD (Requirement 19) */}
+          {/* Development diagnostic HUD */}
           {showDiag && arDiagnostics && (
             <View style={styles.diagContainer} pointerEvents="none">
               <Text style={styles.diagTitle}>⚙ AR DIAGNOSTIC MODE</Text>
-              <Text style={styles.diagLine}>Reticle: ({arDiagnostics.reticleX?.toFixed(0)}, {arDiagnostics.reticleY?.toFixed(0)}) | Viewport: {arDiagnostics.viewportW}x{arDiagnostics.viewportH} | Rot: {arDiagnostics.rotation}</Text>
-              <Text style={styles.diagLine}>Tracking: {trackingQuality} | CandValid: {candidateValid ? 'YES' : 'NO'}</Text>
-              <Text style={styles.diagLine}>Candidate World: X={arDiagnostics.candidateX?.toFixed(3)} Y={arDiagnostics.candidateY?.toFixed(3)} Z={arDiagnostics.candidateZ?.toFixed(3)}</Text>
-              <Text style={styles.diagLine}>P1 Locked: {arDiagnostics.p1 ? `${arDiagnostics.p1[0].toFixed(3)}, ${arDiagnostics.p1[1].toFixed(3)}, ${arDiagnostics.p1[2].toFixed(3)}` : 'NONE'}</Text>
-              <Text style={styles.diagLine}>P2 Locked: {arDiagnostics.p2 ? `${arDiagnostics.p2[0].toFixed(3)}, ${arDiagnostics.p2[1].toFixed(3)}, ${arDiagnostics.p2[2].toFixed(3)}` : 'NONE'}</Text>
-              <Text style={styles.diagLine}>P3 Locked: {arDiagnostics.p3 ? `${arDiagnostics.p3[0].toFixed(3)}, ${arDiagnostics.p3[1].toFixed(3)}, ${arDiagnostics.p3[2].toFixed(3)}` : 'NONE'}</Text>
-              <Text style={styles.diagLine}>P4 Locked: {arDiagnostics.p4 ? `${arDiagnostics.p4[0].toFixed(3)}, ${arDiagnostics.p4[1].toFixed(3)}, ${arDiagnostics.p4[2].toFixed(3)}` : 'NONE'}</Text>
+              <Text style={styles.diagLine}>
+                Viewport {arDiagnostics.viewportW}x{arDiagnostics.viewportH} | Tracking {arDiagnostics.trackingState || trackingQuality}
+              </Text>
+              <Text style={styles.diagLine}>
+                LiDAR {arDiagnostics.lidarAvailable ? 'yes' : 'no'} | Depth {arDiagnostics.depthAvailable ? 'yes' : 'no'} | Steady {arDiagnostics.deviceMotionStable ? 'yes' : 'no'}
+              </Text>
+              {/* THE acceptance readout for "a placed point does not move": how far ARKit has
+                  refined the placed anchors since placement. Millimetres here is healthy — that
+                  correction is what holds each marker on its physical corner. */}
+              <Text style={[styles.diagLine, {
+                color: (arDiagnostics.anchorRefinementMm || 0) > 30 ? '#fbbf24' : '#4ade80',
+              }]}>
+                Anchor refinement: {typeof arDiagnostics.anchorRefinementMm === 'number'
+                  ? `${arDiagnostics.anchorRefinementMm.toFixed(1)} mm`
+                  : '—'}
+                {typeof arDiagnostics.parentAnchorDriftCm === 'number'
+                  ? `  | map drift ${arDiagnostics.parentAnchorDriftCm.toFixed(1)} cm`
+                  : ''}
+              </Text>
+              <Text style={styles.diagLine}>
+                Source: {arDiagnostics.candidateSource || '—'}
+                {arDiagnostics.candidateSource === 'estimatedPlane' ? '  ⚠ inferred (may be off-object)' : ''}
+                {typeof arDiagnostics.normalSpreadDegrees === 'number'
+                  ? `  | normals ${arDiagnostics.normalSpreadDegrees.toFixed(0)}°`
+                  : ''}
+                {arDiagnostics.hasEdgeEvidence ? ' ✓edge' : ''}
+              </Text>
+              <Text style={styles.diagLine}>
+                Candidate: X={arDiagnostics.candidateX?.toFixed(3)} Y={arDiagnostics.candidateY?.toFixed(3)} Z={arDiagnostics.candidateZ?.toFixed(3)}
+              </Text>
+              {arPoints.map((point, index) => (
+                <Text key={index} style={styles.diagLine}>
+                  Point {index + 1}: {point.x.toFixed(3)}, {point.y.toFixed(3)}, {point.z.toFixed(3)}
+                </Text>
+              ))}
             </View>
           )}
 
-          {/* Bottom Controls Bar (iPhone Measure UI) */}
+          {/* Bottom controls */}
           <View style={styles.arBottomBar} pointerEvents="box-none">
-            {/* Validated Summary Card + Analyze Block CTA (when points === 4) */}
-            {arPoints.length === 4 && arLength !== null && (
+            {/* --- Face under review -------------------------------------------
+                Shown once four corners are placed. The officer must CONFIRM the
+                face; nothing advances automatically. */}
+            {pendingFace && (
               <View style={styles.validatedSummaryCard}>
                 <View style={styles.validatedHeader}>
-                  <Text style={styles.validatedBadge}>✓ Measurement Validated</Text>
+                  <Text style={styles.validatedBadge}>
+                    {pendingFace.name} — face {faceIndex + 1} of {FACE_PLAN.length} · 4 corners placed
+                  </Text>
                 </View>
                 <View style={styles.validatedGrid}>
                   <View style={styles.valCell}>
-                    <Text style={styles.valLabel}>Length</Text>
-                    <Text style={styles.valValue}>{arLength.toFixed(2)} m</Text>
+                    <Text style={styles.valLabel}>
+                      {pendingFace.dimensionType === 'length' ? 'Length' : 'Breadth'}
+                    </Text>
+                    <Text style={styles.valValue}>{pendingFace.dimension.toFixed(2)} m</Text>
                   </View>
                   <View style={styles.valCell}>
                     <Text style={styles.valLabel}>Height</Text>
-                    <Text style={styles.valValue}>{arHeight.toFixed(2)} m</Text>
+                    <Text style={styles.valValue}>{pendingFace.height.toFixed(2)} m</Text>
                   </View>
                   <View style={styles.valCell}>
-                    <Text style={styles.valLabel}>Breadth</Text>
-                    <Text style={styles.valValue}>{arBreadth.toFixed(2)} m</Text>
-                  </View>
-                  <View style={styles.valCell}>
-                    <Text style={styles.valLabel}>Volume</Text>
-                    <Text style={styles.valValueHighlight}>{arVolume} m³</Text>
+                    <Text style={styles.valLabel}>Opposite edges</Text>
+                    <Text style={styles.valValue}>
+                      {(pendingFace.edges.oppositeHorizontalGapM * 100).toFixed(1)} /{' '}
+                      {(pendingFace.edges.oppositeVerticalGapM * 100).toFixed(1)} cm
+                    </Text>
                   </View>
                 </View>
-                <TouchableOpacity
-                  style={styles.analyzeCtaBtn}
-                  onPress={() => setScreen('new-inspection')}
-                >
-                  <Text style={styles.analyzeCtaText}>✓ USE THESE MEASUREMENTS</Text>
+                {pendingFace.warnings.length > 0 && pendingFace.warnings.map((w, i) => (
+                  <Text key={i} style={styles.arProblemText}>⚠ {w}</Text>
+                ))}
+                <TouchableOpacity style={styles.analyzeCtaBtn} onPress={confirmCurrentFace}>
+                  <Text style={styles.analyzeCtaText}>
+                    ✓ CONFIRM {pendingFace.name.toUpperCase()} FACE
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.arClearBtn} onPress={resetCurrentFace}>
+                  <Text style={styles.arClearBtnText}>↺  Re-measure this face</Text>
                 </TouchableOpacity>
               </View>
             )}
 
-            {/* Bottom Row Controls */}
+            {/* --- Final reconciliation ----------------------------------------
+                Only after all four faces are confirmed. The volume does not
+                exist before this point. */}
+            {allFacesCaptured && !pendingFace && reconciliation && (
+              <View style={styles.validatedSummaryCard}>
+                <View style={styles.validatedHeader}>
+                  <Text style={styles.validatedBadge}>
+                    MULTI-FACE MEASUREMENT COMPLETE — 16 points across 4 faces
+                  </Text>
+                </View>
+
+                {faces.filter(Boolean).map((face) => (
+                  <Text key={face.index} style={styles.diagLine}>
+                    {face.name}: {face.dimensionType === 'length' ? 'L' : 'B'}{' '}
+                    {face.dimension.toFixed(3)} m · H {face.height.toFixed(3)} m
+                    {face.lowConfidence ? '  ⚠' : ''}
+                  </Text>
+                ))}
+
+                <View style={styles.validatedGrid}>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Length</Text>
+                    <Text style={styles.valValue}>
+                      {reconciliation.finalLengthM != null
+                        ? `${reconciliation.finalLengthM.toFixed(3)} m` : '—'}
+                    </Text>
+                  </View>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Breadth</Text>
+                    <Text style={styles.valValue}>
+                      {reconciliation.finalBreadthM != null
+                        ? `${reconciliation.finalBreadthM.toFixed(3)} m` : '—'}
+                    </Text>
+                  </View>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Height</Text>
+                    <Text style={styles.valValue}>
+                      {reconciliation.finalHeightM != null
+                        ? `${reconciliation.finalHeightM.toFixed(3)} m` : '—'}
+                    </Text>
+                  </View>
+                  <View style={styles.valCell}>
+                    <Text style={styles.valLabel}>Volume</Text>
+                    <Text style={styles.valValueHighlight}>
+                      {reconciliation.volumeM3 != null
+                        ? `${reconciliation.volumeM3.toFixed(3)} m³` : 'NOT AVAILABLE'}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Agreement between the repeated observations. */}
+                {reconciliation.length && (
+                  <Text style={styles.diagLine}>
+                    Length  Front vs Back: {(reconciliation.length.gapM * 100).toFixed(1)} cm apart
+                    {'  '}(tolerance {(reconciliation.length.toleranceM * 100).toFixed(1)} cm)
+                  </Text>
+                )}
+                {reconciliation.breadth && (
+                  <Text style={styles.diagLine}>
+                    Breadth Right vs Left: {(reconciliation.breadth.gapM * 100).toFixed(1)} cm apart
+                    {'  '}(tolerance {(reconciliation.breadth.toleranceM * 100).toFixed(1)} cm)
+                  </Text>
+                )}
+                {reconciliation.height && (
+                  <Text style={styles.diagLine}>
+                    Height spread across 4 faces: {(reconciliation.height.spreadM * 100).toFixed(1)} cm
+                    {'  '}(tolerance {(reconciliation.height.toleranceM * 100).toFixed(1)} cm)
+                  </Text>
+                )}
+                <Text style={styles.diagLine}>
+                  Tolerances: {reconciliation.tolerancesUsed.calibrationStatus}
+                </Text>
+
+                {reconciliation.blockingReasons.map((reason, i) => (
+                  <Text key={i} style={styles.arProblemText}>⚠ {reason}</Text>
+                ))}
+
+                {/* When observations disagree the blocking reason names the face;
+                    re-measure just that one, keeping the other three. */}
+                {!canUseMeasurement && (
+                  <View style={styles.arFooterRow}>
+                    {FACE_PLAN.map((spec) => (
+                      <TouchableOpacity
+                        key={`re-${spec.index}`}
+                        style={styles.arClearBtn}
+                        onPress={() => remeasureFace(spec.index)}
+                      >
+                        <Text style={styles.arClearBtnText}>↺ {spec.name}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={[styles.analyzeCtaBtn, !canUseMeasurement && { opacity: 0.45 }]}
+                  onPress={acceptARMeasurement}
+                  disabled={!canUseMeasurement}
+                >
+                  <Text style={styles.analyzeCtaText}>
+                    {canUseMeasurement
+                      ? '✓ USE THESE MEASUREMENTS'
+                      : '✗ MEASUREMENTS DO NOT RECONCILE'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
             <View style={styles.arBottomRow}>
-              {/* Reset / Undo Button (Left) */}
+              {/* Undo the last point only — a single misplaced corner should not cost the whole
+                  measurement. */}
               <TouchableOpacity
-                style={styles.arCircleBtn}
-                onPress={resetAR}
+                style={[styles.arCircleBtn, arPoints.length === 0 && styles.arCircleBtnDisabled]}
+                onPress={undoLastARPoint}
+                disabled={arPoints.length === 0}
                 activeOpacity={0.7}
               >
-                <Text style={styles.arCircleBtnIcon}>↺</Text>
+                <Text style={styles.arCircleBtnIcon}>↶</Text>
               </TouchableOpacity>
 
-              {/* Action "+" Button (Center - when points < 4) */}
-              {arPoints.length < 4 && (
+              {arPoints.length < 4 ? (
                 <TouchableOpacity
                   style={[
                     styles.arPlusBtn,
                     { backgroundColor: candidateValid ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)' }
                   ]}
-                  onPress={() => {
-                    setTapToken(prev => prev + 1);
-                  }}
+                  onPress={placeARPoint}
                   activeOpacity={0.7}
                 >
                   <View style={styles.arPlusIconInner}>
                     <Text style={styles.arPlusText}>+</Text>
                   </View>
                 </TouchableOpacity>
+              ) : (
+                <View style={styles.arPlusBtnPlaceholder} />
               )}
 
-              {/* Back Button (Right) */}
               <TouchableOpacity
                 style={styles.arCircleBtn}
                 onPress={() => setScreen('new-inspection')}
@@ -1660,15 +2247,38 @@ export default function App() {
               </TouchableOpacity>
             </View>
 
-            {/* Bottom Mode Selector */}
-            <View style={styles.bottomModeSelector}>
-              <View style={styles.modeTabActive}>
-                <Text style={styles.modeTabActiveText}>Measure</Text>
-              </View>
-              <View style={styles.modeTabInactive}>
-                <Text style={styles.modeTabInactiveText}>Level</Text>
-              </View>
+            <View style={styles.arFooterRow}>
+              {/* Scope matters: one clears the current face, the other the whole
+                  multi-face measurement. They are never the same action. */}
+              <TouchableOpacity onPress={resetCurrentFace} activeOpacity={0.7} style={styles.arClearBtn}>
+                <Text style={styles.arClearBtnText}>↺  Clear this face</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  if (capturedFaceCount === 0 && arPoints.length === 0) { resetAR(); return; }
+                  Alert.alert(
+                    'Restart all four faces?',
+                    `This discards ${capturedFaceCount} confirmed face(s) and starts the ` +
+                    `multi-face measurement again from the Front face.`,
+                    [
+                      { text: 'Keep measuring', style: 'cancel' },
+                      { text: 'Restart all', style: 'destructive', onPress: resetAR },
+                    ]
+                  );
+                }}
+                activeOpacity={0.7}
+                style={styles.arClearBtn}
+              >
+                <Text style={styles.arClearBtnText}>⟲  Restart all 4 faces</Text>
+              </TouchableOpacity>
             </View>
+
+            {/* Native's own last word, verbatim. It is the most specific thing the app knows. */}
+            {arStatus ? (
+              <Text style={styles.arStatusLine} numberOfLines={2} pointerEvents="none">
+                {arStatus}
+              </Text>
+            ) : null}
           </View>
         </View>
       )}
@@ -2065,7 +2675,7 @@ export default function App() {
                     setScreen('ar-measure');
                   }}
                 >
-                  <Text style={styles.btnSecText}>🔄 RE-MEASURE (AR)</Text>
+                  <Text style={styles.btnSecText}>🔄 RE-MEASURE (4 FACES)</Text>
                 </TouchableOpacity>
 
               </View>
@@ -2079,7 +2689,7 @@ export default function App() {
                   setScreen('ar-measure');
                 }}
               >
-                <Text style={styles.btnSecText}>📐 OPEN AR MEASUREMENT</Text>
+                <Text style={styles.btnSecText}>📐 START MULTI-FACE MEASUREMENT</Text>
               </TouchableOpacity>
 
             )}
@@ -3297,16 +3907,6 @@ const styles =
     // AR styles
     // =======================================================
 
-    arContainer: {
-      flex: 1,
-      backgroundColor:
-        '#000',
-    },
-
-    arView: {
-      flex: 1,
-    },
-
     arOverlay: {
       ...StyleSheet.absoluteFillObject,
       justifyContent:
@@ -3339,18 +3939,24 @@ const styles =
       zIndex: 10,
     },
     reticleRing: {
-      width: 36,
-      height: 36,
-      borderRadius: 18,
-      borderWidth: 2,
+      // Sized to match Apple Measure's search reticle proportions (roughly a third of a
+      // portrait phone's width) rather than a small crosshair.
+      width: 120,
+      height: 120,
+      borderRadius: 60,
+      borderWidth: 2.5,
+      // Centres the aiming dot below. Without these the dot renders at the
+      // ring's top-left corner instead of the middle.
       justifyContent: 'center',
       alignItems: 'center',
-      backgroundColor: 'rgba(0, 0, 0, 0.1)',
     },
+    // Centre aiming dot. Marks the exact pixel the native raycast samples, which
+    // is the screen centre - the ring alone shows a 120px target area, not the
+    // point that will actually be placed.
     reticleDot: {
-      width: 6,
-      height: 6,
-      borderRadius: 3,
+      width: 10,
+      height: 10,
+      borderRadius: 5,
     },
     floatingDistanceBadge: {
       position: 'absolute',
@@ -3378,8 +3984,108 @@ const styles =
       right: 0,
       alignItems: 'center',
       zIndex: 20,
+      paddingHorizontal: 16,
+    },
+    // Progress pips: how many of the four points native currently holds.
+    arProgressRow: {
+      flexDirection: 'row',
+      gap: 6,
+      marginTop: 10,
+    },
+    arProgressPip: {
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+      backgroundColor: 'rgba(255, 255, 255, 0.28)',
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.5)',
+    },
+    arProgressPipFilled: {
+      backgroundColor: '#FFFFFF',
+    },
+    // Amber, not red: an advisory describes the shape that was measured, it does not reject it.
+    arAdvisoryPill: {
+      marginTop: 8,
+      alignSelf: 'center',
+      maxWidth: '92%',
+      backgroundColor: 'rgba(180, 83, 9, 0.92)',
+      paddingHorizontal: 14,
+      paddingVertical: 9,
+      borderRadius: 18,
+    },
+    arAdvisoryText: {
+      color: '#FFFFFF',
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    diagToggleBtn: {
+      backgroundColor: 'rgba(0, 0, 0, 0.6)',
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      borderRadius: 16,
+      borderWidth: 1,
+      borderColor: '#334155',
+    },
+    diagToggleBtnOn: {
+      backgroundColor: '#10b981',
+      borderColor: '#10b981',
+    },
+    diagToggleText: {
+      color: '#FFFFFF',
+      fontSize: 11,
+      fontWeight: '700',
+    },
+    arCircleBtnDisabled: {
+      opacity: 0.35,
+    },
+    // Keeps the undo/back buttons on their same edges once the "+" button is gone.
+    arPlusBtnPlaceholder: {
+      width: 68,
+      height: 68,
+    },
+    arFooterRow: {
+      alignItems: 'center',
+      marginTop: 2,
+    },
+    arClearBtn: {
+      paddingHorizontal: 16,
+      paddingVertical: 7,
+      borderRadius: 16,
+      backgroundColor: 'rgba(35, 35, 38, 0.8)',
+      borderWidth: 0.5,
+      borderColor: 'rgba(255, 255, 255, 0.25)',
+    },
+    arClearBtnText: {
+      color: 'rgba(255, 255, 255, 0.85)',
+      fontSize: 13,
+      fontWeight: '600',
+    },
+    arStatusLine: {
+      marginTop: 10,
+      color: 'rgba(255, 255, 255, 0.6)',
+      fontSize: 11,
+      textAlign: 'center',
+      paddingHorizontal: 8,
+    },
+    arProblemPill: {
+      marginTop: 8,
+      alignSelf: 'center',
+      maxWidth: '92%',
+      backgroundColor: 'rgba(220, 38, 38, 0.92)',
+      paddingHorizontal: 14,
+      paddingVertical: 9,
+      borderRadius: 18,
+    },
+    arProblemText: {
+      color: '#FFFFFF',
+      fontSize: 13,
+      fontWeight: '700',
+      textAlign: 'center',
     },
     topStatusPill: {
+      // Shrinks rather than pushing the DIAG toggle off the edge on a narrow screen.
+      flexShrink: 1,
       backgroundColor: 'rgba(28, 28, 30, 0.75)',
       paddingHorizontal: 16,
       paddingVertical: 8,
@@ -3445,35 +4151,6 @@ const styles =
       fontSize: 38,
       fontWeight: '300',
       marginTop: -2,
-    },
-    bottomModeSelector: {
-      flexDirection: 'row',
-      backgroundColor: 'rgba(35, 35, 38, 0.85)',
-      borderRadius: 20,
-      padding: 3,
-      borderWidth: 0.5,
-      borderColor: 'rgba(255, 255, 255, 0.2)',
-    },
-    modeTabActive: {
-      backgroundColor: 'rgba(255, 255, 255, 0.25)',
-      paddingHorizontal: 18,
-      paddingVertical: 5,
-      borderRadius: 17,
-    },
-    modeTabActiveText: {
-      color: '#FFFFFF',
-      fontSize: 13,
-      fontWeight: '600',
-    },
-    modeTabInactive: {
-      paddingHorizontal: 18,
-      paddingVertical: 5,
-      borderRadius: 17,
-    },
-    modeTabInactiveText: {
-      color: 'rgba(255, 255, 255, 0.5)',
-      fontSize: 13,
-      fontWeight: '500',
     },
     validatedSummaryCard: {
       width: '100%',

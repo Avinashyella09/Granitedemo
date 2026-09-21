@@ -74,6 +74,20 @@ class Block(Document):
     
     # Analytics Extensions
     inspecting_officer_id = fields.StringField(max_length=100)
+
+    # What the field app actually submitted, kept verbatim even when the
+    # referenced document does not exist yet.
+    #
+    # `quarry` above is a ReferenceField, so it can only hold a link to a real
+    # Quarry document. Before these fields existed, an AR submission naming a
+    # quarry that had not been registered was saved with quarry=None and the
+    # submitted identifier was lost entirely - the block then dropped out of
+    # every quarry analytic with nothing left to reconcile it against.
+    # These preserve the claim so it can be resolved later without guessing.
+    submitted_quarry_id = fields.StringField(max_length=100)
+    # Machine-readable markers such as 'quarry_unresolved' / 'officer_unresolved'.
+    # Empty list means every submitted reference resolved to a real document.
+    reference_warnings = fields.ListField(fields.StringField(max_length=100), default=list)
     inspection_duration_seconds = fields.IntField(default=0)
     capture_attempt_count = fields.IntField(default=1)
     lighting_condition = fields.StringField(max_length=50)
@@ -119,7 +133,17 @@ class Assessment(Document):
     }
 
 class AuditLog(Document):
-    block = fields.ReferenceField(Block, reverse_delete_rule=CASCADE)
+    # NULLIFY, not CASCADE.
+    #
+    # Previously reverse_delete_rule=CASCADE meant deleting a Block silently
+    # destroyed its entire audit trail - in a revenue system the audit record
+    # must outlive the operational record it documents. NULLIFY keeps the entry
+    # and clears the dangling reference; block_id_snapshot below preserves which
+    # block it referred to, so traceability survives the deletion.
+    block = fields.ReferenceField(Block, reverse_delete_rule=NULLIFY)
+    # Denormalised at write time so the trail remains readable after the Block
+    # is gone and the reference has been nullified.
+    block_id_snapshot = fields.StringField(max_length=100)
     action = fields.StringField(required=True, max_length=100)
     actor = fields.StringField(required=True, max_length=100)
     details = fields.StringField() # detailed JSON string or description

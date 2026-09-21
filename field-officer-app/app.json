@@ -7,7 +7,15 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.anonymous.fieldofficerapp",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Camera access is required to measure granite blocks using AR and to capture inspection photographs.",
+        "NSLocalNetworkUsageDescription": "This app connects to the Django backend server on your local network to submit block inspections.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -16,7 +24,8 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "package": "com.anonymous.fieldofficerapp"
+      "package": "com.anonymous.fieldofficerapp",
+      "usesCleartextTraffic": true
     },
     "web": {
       "favicon": "./assets/favicon.png"

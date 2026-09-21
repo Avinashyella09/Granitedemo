@@ -40,6 +40,16 @@ class BlockSerializer(serializers.Serializer):
     approved_at = serializers.DateTimeField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
+    # Real capture metadata and reference-resolution state. Previously absent,
+    # which is why the dashboard fell back to the literals 'Sunny' / 1 / 'DEV-N/A'.
+    inspecting_officer_id = serializers.CharField(read_only=True, allow_null=True)
+    submitted_quarry_id = serializers.CharField(read_only=True, allow_null=True)
+    reference_warnings = serializers.ListField(
+        child=serializers.CharField(), read_only=True, required=False
+    )
+    device_id = serializers.CharField(read_only=True, allow_null=True)
+    lighting_condition = serializers.CharField(read_only=True, allow_null=True)
+    capture_attempt_count = serializers.IntegerField(read_only=True, allow_null=True)
 
     def validate_block_id(self, value):
         # We clean and normalize block_id
@@ -55,7 +65,13 @@ class AssessmentSerializer(serializers.Serializer):
     id = serializers.CharField(read_only=True)
     block_id = serializers.CharField(max_length=100)
     granite_category = serializers.CharField(max_length=100)
-    gangsaw_classification = serializers.CharField(max_length=100)
+    # Accepted for backward compatibility with existing clients, but NOT
+    # authoritative: the server derives the classification from the stored
+    # dimensions via the official >270cm x 150cm rule (blocks/seigniorage.py).
+    # Optional because a correct client no longer needs to send it at all.
+    gangsaw_classification = serializers.CharField(
+        max_length=100, required=False, allow_blank=True
+    )
     volume_m3 = serializers.FloatField(read_only=True)
     weight_mt = serializers.FloatField(read_only=True)
     rate_per_mt = serializers.FloatField(read_only=True)

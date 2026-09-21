@@ -1,0 +1,54 @@
+# Graniteblocks backend dependencies
+# Python 3.14.5
+#
+# Versions are taken from the working reference environment, not from memory.
+# Derived from the imports actually present in backend/ and cv_pipeline/.
+
+# --- Web framework -----------------------------------------------------------
+Django==6.1.1
+djangorestframework==3.18.1
+django-cors-headers==4.9.0
+
+# --- MongoDB -----------------------------------------------------------------
+mongoengine==0.29.3
+pymongo==4.18.0
+# Required for mongodb+srv:// (Atlas) URIs - without it the SRV lookup fails.
+dnspython==2.8.0
+
+# --- Media and reporting ------------------------------------------------------
+# Pillow backs DRF's ImageField validation (blocks/serializers.py:49) and the
+# image embedding in blocks/pdf_generator.py.
+pillow==12.3.0
+reportlab==5.0.1
+
+# --- Environment --------------------------------------------------------------
+# Present in the reference environment. NOTE: backend/settings.py:49-56 currently
+# hand-rolls its own .env parser and does not import this; kept for parity with
+# the reference env and for tooling that expects it.
+python-dotenv==1.2.3
+
+# --- Computer vision ----------------------------------------------------------
+# REQUIRED, not optional: blocks/views.py:387 does a MODULE-LEVEL
+#   from cv_pipeline.pipeline import GraniteCVPipeline
+# which chains cv_pipeline/segmentor.py:2 -> `from ultralytics import YOLO` -> torch.
+# Django cannot import the blocks URLconf without this stack installed, even
+# though the /measure-cv/ endpoint itself is non-functional.
+# ~720 MB installed. Moving that import inside the view would remove the need,
+# but that is a source change and out of scope for this step.
+numpy==2.5.3
+opencv-python==5.0.0.93
+ultralytics==8.4.144
+torch==2.14.0
+torchvision==0.29.0
+
+# --- Test isolation -----------------------------------------------------------
+# In-memory MongoDB replacement. The reference-data tests bind mongoengine to
+# mongomock so they can never reach the real Atlas cluster. Required by
+# blocks/tests_reference_data.py.
+mongomock==4.3.0
+# Pulled in automatically by ultralytics at import time (HEIF support). Pinned
+# here so the environment is reproducible instead of self-modifying at runtime.
+pi-heif==1.4.0
+# PDF text extraction, used only by blocks/tests_pdf_report.py to assert the
+# generated report actually contains the required values.
+pypdf==6.1.1

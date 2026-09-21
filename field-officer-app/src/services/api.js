@@ -1,4 +1,91 @@
-let apiBaseUrl = 'http://192.168.1.161:8000'; // Active LAN IP for physical device testing
+import { NativeModules } from 'react-native';
+// TurboModule-backed accessor for the Metro URL. NativeModules.SourceCode is
+// NOT populated under React Native 0.81's new architecture - verified on
+// device, where it fell through to the localhost fallback. getDevServer()
+// reads NativeSourceCode.getConstants().scriptURL, which is.
+import getDevServer from 'react-native/Libraries/Core/Devtools/getDevServer';
+
+// --- API host resolution -----------------------------------------------------
+//
+// THE API HOST IS DERIVED, NOT HARDCODED.
+//
+// A hardcoded LAN IP has now gone stale three times on this network
+// (192.168.1.158 -> 192.168.1.184 -> 192.168.0.82). Each time, the app kept
+// calling a dead address and hung until React Native's 60-second default
+// timeout, surfacing as "Network request timed out" at ANALYZE BLOCK - long
+// after the officer finished measuring.
+//
+// The Metro dev server always runs on the same machine as the Django API, and
+// React Native already knows its address: NativeModules.SourceCode.scriptURL is
+// the URL the JS bundle was loaded from, e.g.
+//     http://192.168.0.82:8081/index.bundle?platform=ios&dev=true
+// Taking the HOST from it and forcing the API PORT keeps the API host correct
+// automatically whenever the network reassigns the Mac's address.
+//
+// The two URLs stay strictly separate, which is the point: only the host is
+// shared (it is the same machine). The bundle port is Metro's; the API port is
+// always API_PORT below. The API URL is never used as a bundle URL, and the
+// bundle URL is never used for API calls.
+const API_PORT = 8000;
+
+const hostFromUrl = (url) => {
+  if (typeof url !== 'string') return null;
+  const host = url.split('://')[1]?.split('/')[0]?.split(':')[0];
+  return host && host !== 'localhost' && host !== '127.0.0.1' ? host : null;
+};
+
+const deriveApiBaseUrl = () => {
+  // 1. The TurboModule path (RN 0.81 new architecture).
+  try {
+    const dev = getDevServer();
+    if (dev?.bundleLoadedFromServer) {
+      const host = hostFromUrl(dev.url);
+      if (host) return `http://${host}:${API_PORT}`;
+    }
+  } catch { /* fall through */ }
+
+  // 2. Legacy bridge path, for completeness.
+  try {
+    const host = hostFromUrl(NativeModules?.SourceCode?.scriptURL);
+    if (host) return `http://${host}:${API_PORT}`;
+  } catch { /* fall through */ }
+
+  // 3. Release builds have no dev server; a deployment sets the host explicitly
+  //    via the login screen's server field.
+  return `http://127.0.0.1:${API_PORT}`;
+};
+
+let apiBaseUrl = deriveApiBaseUrl();
+
+// Logged once at startup so a host problem is visible in Metro immediately,
+// rather than only surfacing as a timeout at ANALYZE BLOCK.
+console.log(`[API] base URL resolved to ${apiBaseUrl}`);
+
+// How long to wait before giving up on a request. React Native's default is 60
+// seconds, which is far too long to leave an officer staring at a spinner when
+// the host is simply unreachable - the successful round trip measured on this
+// project is ~1.1 s including a 2 MB photo.
+const REQUEST_TIMEOUT_MS = 20000;
+
+const withTimeout = async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err && (err.name === 'AbortError' || /abort/i.test(err.message || ''))) {
+      const host = apiBaseUrl.replace('http://', '');
+      throw new Error(
+        `The server at ${host} did not respond within ${timeoutMs / 1000} seconds.\n\n` +
+        `Check that Django is running and that the phone and Mac are on the same Wi-Fi. ` +
+        `The current server address can be changed on the login screen.`
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 export const setApiBaseUrl = (url) => {
   if (url.endsWith('/')) {
@@ -21,7 +108,7 @@ export const apiService = {
   },
 
   getBlocks: async () => {
-    const res = await fetch(`${apiBaseUrl}/api/blocks/`);
+    const res = await withTimeout(`${apiBaseUrl}/api/blocks/`);
     if (!res.ok) {
       throw new Error(`Failed to fetch blocks list: ${res.status}`);
     }
@@ -29,7 +116,7 @@ export const apiService = {
   },
 
   createBlock: async (payload) => {
-    const res = await fetch(`${apiBaseUrl}/api/blocks/`, {
+    const res = await withTimeout(`${apiBaseUrl}/api/blocks/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -85,7 +172,7 @@ export const apiService = {
     console.log(`[PERF] Upload started: ${new Date().toISOString()}`);
 
     try {
-      const res = await fetch(endpoint, {
+      const res = await withTimeout(endpoint, {
         method: 'POST',
         body: formData,
       });
@@ -130,7 +217,7 @@ export const apiService = {
       type: fileType,
     });
 
-    const res = await fetch(`${apiBaseUrl}/api/blocks/${blockId}/measure-cv/`, {
+    const res = await withTimeout(`${apiBaseUrl}/api/blocks/${blockId}/measure-cv/`, {
       method: 'POST',
       body: formData,
       headers: {

@@ -29,3 +29,17 @@ scratch/
 **/modules/granite-ar/android/build/
 *.apk
 
+
+# Python virtual environment for the backend (1.2 GB).
+# Previously only self-ignored by the venv's own auto-created .gitignore stub;
+# removing that stub would have pulled the whole tree into the index.
+/backend/venv/
+
+# macOS finder metadata.
+.DS_Store
+
+# Raw capture footage used for AR bench testing (75 MB). Kept locally; git is
+# the wrong place for large binary video and it is not needed to build or run
+# any part of the system.
+/Test-images/*.MP4
+/Test-images/*.mov

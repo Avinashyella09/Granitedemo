@@ -1,5 +1,9 @@
 from django.urls import path
 from .views import (
+    AuthMeAPIView,
+    AuthCsrfAPIView,
+    AuthLoginAPIView,
+    AuthLogoutAPIView,
     BlockListCreateAPIView, 
     BlockDetailAPIView, 
     AssessmentListCreateAPIView, 
@@ -10,6 +14,7 @@ from .views import (
     BlockApproveAPIView,
     BlockPDFAPIView,
     BlockAuditLogsAPIView,
+    OMEPSExportAPIView,
     
     # Analytics views
     OfficerAnalyticsAPIView,
@@ -47,4 +52,13 @@ urlpatterns = [
     path('analytics/alerts/', AnalyticsAlertsAPIView.as_view(), name='analytics-alerts'),
     path('analytics/map-data/', MapDataAPIView.as_view(), name='analytics-map-data'),
     path('analytics/overview/', ExecutiveOverviewAPIView.as_view(), name='analytics-overview'),
+    # OMEPS-ready export / integration contract - pending official OMEPS schema.
+    path('export/omeps/<str:block_id>/', OMEPSExportAPIView.as_view(), name='omeps-export'),
+
+    # Phase 6E: dashboard signs in with username/password and gets a Django
+    # session. Token auth stays available for API clients (see settings).
+    path('auth/csrf/', AuthCsrfAPIView.as_view(), name='auth-csrf'),
+    path('auth/login/', AuthLoginAPIView.as_view(), name='auth-login'),
+    path('auth/logout/', AuthLogoutAPIView.as_view(), name='auth-logout'),
+    path('auth/me/', AuthMeAPIView.as_view(), name='auth-me'),
 ]
